@@ -8,6 +8,8 @@ numpy>=1.24,<2
 tqdm>=4.64
 requests>=2.31
 pillow>=10.0
+huggingface_hub>=0.21
+pyarrow>=18
 
 # FAISS (optional; remove if it fails to build)
 faiss-cpu>=1.8
