@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+
+# Data / models / artifacts (keep big stuff out of git)
+data/
+indexes/
+artifacts/
+models/
+*.pt
+*.bin
+*.h5
+*.model
+*.npy
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
