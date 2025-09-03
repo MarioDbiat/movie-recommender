@@ -335,7 +335,7 @@ st.title("🎬 Movie Recommender")
 st.write(
     "Type a **movie name** or a short **description**. "
     "If you enable *Use genres of query movie*, the app will look up the movie's genres "
-    "and softly boost results that share them. If the movie has no genres, search runs normally. Same goes to *Filter by franchise* and *Safe mode* "
+    "and softly boost results that share them. If the movie has no genres, search runs normally. Same goes to *Filter by franchise* and *Safe mode*."
 )
 
 query = st.text_input("Search", placeholder="e.g., Interstellar  •  gritty space survival")
