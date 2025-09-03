@@ -8,7 +8,6 @@ numpy>=1.24,<2
 tqdm>=4.64
 requests>=2.31
 pillow>=10.0
-tmdbv3api>=1.9   # only if you fetch posters
 
 # FAISS (optional; remove if it fails to build)
 faiss-cpu>=1.8
