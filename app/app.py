@@ -8,21 +8,18 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import hf_hub_download
 
-
 # ---------------- Warnings ----------------
 import warnings
 warnings.filterwarnings(
     "ignore",
     message="You are using `torch.load` with `weights_only=False`",
 )
-# Or to hide all FutureWarnings from transformers:
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
-
 
 # ---------------- Config ---------------
 # Hugging Face model & dataset
-MODEL_ID     = "Mariodb/movie-recommender-model"     # <- your fine-tuned SBERT
-HF_REPO_ID   = "Mariodb/movie-recommender-dataset"   # <- dataset repo
+MODEL_ID     = "Mariodb/movie-recommender-model"     # your fine-tuned SBERT
+HF_REPO_ID   = "Mariodb/movie-recommender-dataset"   # dataset repo
 HF_REPO_TYPE = "dataset"
 HF_DF_FILE   = "movies.parquet"                      # metadata
 HF_IDX_FILE  = "movie_index.faiss"                   # FAISS
@@ -202,7 +199,7 @@ def _hf_path(filename: str) -> str:
         repo_id=HF_REPO_ID,
         filename=filename,
         repo_type=HF_REPO_TYPE,
-        local_dir="data",               # cache in ./data so devs can inspect
+        local_dir="data",
         local_dir_use_symlinks=False
     )
 
@@ -216,16 +213,13 @@ def _download_df_from_hf() -> pd.DataFrame:
 # ---------------- Cached loaders ----------------
 @st.cache_resource
 def load_model():
-    # use your HF model repo
     return SentenceTransformer(MODEL_ID)
 
 @st.cache_resource
 def load_metadata() -> pd.DataFrame:
-    # Try HF first
     try:
         df = _download_df_from_hf()
     except Exception as e:
-        # Fallback to local CSV if present
         if os.path.exists(DATA_CSV):
             df = pd.read_csv(DATA_CSV)
         else:
@@ -235,7 +229,6 @@ def load_metadata() -> pd.DataFrame:
             )
             st.stop()
 
-    # Normalize expected columns
     for col in ["title", "overview", "genres", "franchise"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
@@ -244,27 +237,32 @@ def load_metadata() -> pd.DataFrame:
     if "genres" in df.columns:
         df["genres"] = df["genres"].apply(lambda s: "" if str(s).strip().lower() == "unknown" else s)
 
-    # Ensure franchise present/filled
     df = _ensure_franchise(df)
     return df
 
 @st.cache_resource
 def load_faiss():
-    """Read FAISS index. Prefer local path if present; otherwise pull from HF."""
+    """Read FAISS index via memory-mapping to reduce RAM usage."""
     if not FAISS_OK:
         return None
-    path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(HF_IDX_FILE)
-    return faiss.read_index(path)
+    try:
+        path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(HF_IDX_FILE)
+        # Memory-map instead of loading entirely into RAM
+        return faiss.read_index(path, faiss.IO_FLAG_MMAP)
+    except Exception:
+        # Any failure -> fall back to cosine later
+        return None
 
 @st.cache_resource
 def load_embeddings() -> Optional[np.ndarray]:
-    """Read embeddings. Prefer local path if present; otherwise pull from HF."""
-    path = EMB_PATH if os.path.exists(EMB_PATH) else _hf_path(HF_EMB_FILE)
-    if not os.path.exists(path):
+    """Read embeddings (memory-mapped). Used only if FAISS is unavailable."""
+    try:
+        path = EMB_PATH if os.path.exists(EMB_PATH) else _hf_path(HF_EMB_FILE)
+        if not os.path.exists(path):
+            return None
+        return np.load(path, mmap_mode="r")
+    except Exception:
         return None
-    # mmap keeps memory low for the 1.2GB file
-    arr = np.load(path, mmap_mode="r")
-    return arr
 
 # ---------------- Search helpers ----------------
 def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int):
@@ -282,15 +280,23 @@ def run_search(query_text: str, franchise_only: bool, safe_mode: bool, use_genre
     base_pool = POOL_WIDE if use_genres else POOL_BASE
     pool = int(min(POOL_MAX, max(base_pool, top_k * 10)))
 
+    idx = None
+
+    # Try FAISS first
     faiss_index = load_faiss()
     if faiss_index is not None:
-        q = q_vec / (np.linalg.norm(q_vec) + 1e-12)
-        D, I = faiss_index.search(q[None, :], pool)
-        idx = I[0]
-    else:
+        try:
+            q = q_vec / (np.linalg.norm(q_vec) + 1e-12)
+            D, I = faiss_index.search(q[None, :], pool)
+            idx = I[0]
+        except Exception:
+            idx = None  # fall back below
+
+    # Cosine fallback (embeddings are memory-mapped)
+    if idx is None:
         emb = load_embeddings()
         if emb is None:
-            st.error("No FAISS index or embeddings fallback found. Add one of them.")
+            st.error("No FAISS index or embeddings fallback found. Add one of them (prefer memory-mapped FAISS).")
             return pd.DataFrame()
         idx, _ = cosine_topk(q_vec, emb, pool)
 
