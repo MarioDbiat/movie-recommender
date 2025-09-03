@@ -8,17 +8,30 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import hf_hub_download
 
-# ---------------- Config ----------------
-# Hugging Face dataset as primary source
-HF_REPO_ID = "Mariodb/movie-recommender-dataset"
-HF_FILENAME = "movies.parquet"
+
+# ---------------- Warnings ----------------
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="You are using `torch.load` with `weights_only=False`",
+)
+# Or to hide all FutureWarnings from transformers:
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+
+
+# ---------------- Config ---------------
+# Hugging Face model & dataset
+MODEL_ID     = "Mariodb/movie-recommender-model"     # <- your fine-tuned SBERT
+HF_REPO_ID   = "Mariodb/movie-recommender-dataset"   # <- dataset repo
 HF_REPO_TYPE = "dataset"
+HF_DF_FILE   = "movies.parquet"                      # metadata
+HF_IDX_FILE  = "movie_index.faiss"                   # FAISS
+HF_EMB_FILE  = "movie_embeddings.npy"                # embeddings
 
 # Local fallbacks (used only if HF fetch fails)
-DATA_CSV  = "data/movies.csv"                 # optional local CSV fallback
-FAISS_PATH = "indexes/movie_index.faiss"      # optional FAISS index
-EMB_PATH   = "artifacts/movie_embeddings.npy" # optional embeddings fallback
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+DATA_CSV   = "data/movies.csv"
+FAISS_PATH = "indexes/movie_index.faiss"
+EMB_PATH   = "artifacts/movie_embeddings.npy"
 
 POOL_BASE = 50
 POOL_WIDE = 300
@@ -31,7 +44,7 @@ try:
 except Exception:
     FAISS_OK = False
 
-# ---------------- Helpers: Genres ----------------
+# ---------------- Small helpers ----------------
 def _split_genres(s: str) -> List[str]:
     if not isinstance(s, str):
         return []
@@ -51,7 +64,7 @@ def _normalize(arr: np.ndarray) -> np.ndarray:
         return np.zeros_like(arr)
     return (arr - mn) / (mx - mn)
 
-# ---------------- Helpers: Franchise detection ----------------
+# ---------------- Franchise detection ----------------
 _FRANCHISE_KEYWORDS = {
     "marvel": [
         "avengers","iron man","captain america","thor","hulk","black widow","ant-man",
@@ -181,24 +194,30 @@ def _find_query_movie_franchise(df: pd.DataFrame, query_text: str) -> str:
             return str(row.iloc[0]["franchise"]).strip()
     return ""
 
-# ---------------- Cached loaders ----------------
-@st.cache_resource
-def load_model():
-    return SentenceTransformer(MODEL_NAME)
+# ---------------- HF download helpers ----------------
+@st.cache_data
+def _hf_path(filename: str) -> str:
+    """Download a single file from the HF dataset repo and return local cache path."""
+    return hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=filename,
+        repo_type=HF_REPO_TYPE,
+        local_dir="data",               # cache in ./data so devs can inspect
+        local_dir_use_symlinks=False
+    )
 
 @st.cache_data
 def _download_df_from_hf() -> pd.DataFrame:
-    """Primary source: download once from HF Hub and cache."""
-    local_path = hf_hub_download(
-        repo_id=HF_REPO_ID,
-        filename=HF_FILENAME,
-        repo_type=HF_REPO_TYPE,
-        local_dir="data",
-        local_dir_use_symlinks=False
-    )
-    if HF_FILENAME.endswith(".parquet"):
+    local_path = _hf_path(HF_DF_FILE)
+    if HF_DF_FILE.endswith(".parquet"):
         return pd.read_parquet(local_path)
     return pd.read_csv(local_path)
+
+# ---------------- Cached loaders ----------------
+@st.cache_resource
+def load_model():
+    # use your HF model repo
+    return SentenceTransformer(MODEL_ID)
 
 @st.cache_resource
 def load_metadata() -> pd.DataFrame:
@@ -212,7 +231,7 @@ def load_metadata() -> pd.DataFrame:
         else:
             st.error(
                 "Couldn't fetch dataset from Hugging Face and no local CSV found.\n\n"
-                f"Tried: {HF_REPO_ID}/{HF_FILENAME} and {DATA_CSV}\n\nError: {e}"
+                f"Tried: {HF_REPO_ID}/{HF_DF_FILE} and {DATA_CSV}\n\nError: {e}"
             )
             st.stop()
 
@@ -231,13 +250,21 @@ def load_metadata() -> pd.DataFrame:
 
 @st.cache_resource
 def load_faiss():
-    if FAISS_OK and os.path.exists(FAISS_PATH):
-        return faiss.read_index(FAISS_PATH)
-    return None
+    """Read FAISS index. Prefer local path if present; otherwise pull from HF."""
+    if not FAISS_OK:
+        return None
+    path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(HF_IDX_FILE)
+    return faiss.read_index(path)
 
 @st.cache_resource
 def load_embeddings() -> Optional[np.ndarray]:
-    return np.load(EMB_PATH) if os.path.exists(EMB_PATH) else None
+    """Read embeddings. Prefer local path if present; otherwise pull from HF."""
+    path = EMB_PATH if os.path.exists(EMB_PATH) else _hf_path(HF_EMB_FILE)
+    if not os.path.exists(path):
+        return None
+    # mmap keeps memory low for the 1.2GB file
+    arr = np.load(path, mmap_mode="r")
+    return arr
 
 # ---------------- Search helpers ----------------
 def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int):
