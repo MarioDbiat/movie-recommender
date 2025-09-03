@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+transformers
+sentence-transformers
+faiss-cpu
+scikit-learn
+numpy
+pandas
+matplotlib
+seaborn
+streamlit
