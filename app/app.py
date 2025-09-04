@@ -334,15 +334,32 @@ def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int):
     return idx, sims[idx]
 
 def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
-               query_text: str, franchise_only: bool, safe_mode: bool, use_genres: bool, top_k: int) -> pd.DataFrame:
+               query_text: str, franchise_only: bool, safe_mode: bool,
+               use_genres: bool, top_k: int) -> pd.DataFrame:
+    """Return a top-k DataFrame with columns ready for the UI (incl. poster_url)."""
     meta = load_metadata(parquet_name)
     model = load_model()
-    q_vec = model.encode([query_text])[0].astype("float32")
 
+    # Prefer encoding the movie OVERVIEW if the user typed an exact title (richer signal)
+    _q = query_text.strip().lower()
+    if "title" in meta.columns:
+        q_row = meta[meta["title"].str.lower() == _q]
+    else:
+        q_row = pd.DataFrame()
+
+    if (len(q_row) == 1
+        and "overview" in q_row.columns
+        and isinstance(q_row.iloc[0]["overview"], str)
+        and len(q_row.iloc[0]["overview"]) > 20):
+        q_vec = model.encode([q_row.iloc[0]["overview"]])[0].astype("float32")
+    else:
+        q_vec = model.encode([query_text])[0].astype("float32")
+
+    # Candidate pool size
     base_pool = POOL_WIDE if use_genres else POOL_BASE
     pool = int(min(POOL_MAX, max(base_pool, top_k * 10)))
 
-    # --- Retrieve candidate ids (FAISS -> cosine fallback) ---
+    # ---- Retrieve candidate ids (FAISS -> cosine fallback) ----
     idx = None
     faiss_index = load_faiss(index_name)
     if faiss_index is not None:
@@ -351,7 +368,7 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
             D, I = faiss_index.search(q[None, :], pool)
             idx = I[0]
             if idx is not None:
-                idx = idx[idx >= 0]  # guard against -1 entries
+                idx = idx[idx >= 0]  # guard -1 entries
         except Exception as e:
             st.warning(f"FAISS search failed; will try embeddings if enabled. Error: {e}")
             idx = None
@@ -360,7 +377,7 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
         emb = load_embeddings(emb_name)
         if emb is None:
             st.error("Search index unavailable (no FAISS / embeddings). "
-                     "Upload index to HF or enable embeddings locally with LOAD_EMB=1.")
+                     "Upload FAISS to HF or enable embeddings locally with LOAD_EMB=1.")
             return pd.DataFrame()
         idx, _ = cosine_topk(q_vec, emb, pool)
 
@@ -369,67 +386,120 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
 
     results = meta.iloc[idx].copy()
 
-    # --- Post-filtering & safety ---
+    # ---- Post-filtering & safety ----
     q_lower = query_text.strip().lower()
     if "title" in results.columns and q_lower:
-        results = results[results["title"].str.lower() != q_lower]  # remove exact self-match
+        results = results[results["title"].str.lower() != q_lower]  # drop exact self-match
 
+    # Franchise = HARD FILTER (same as notebook)
     if franchise_only and "franchise" in results.columns:
         q_fr = _find_query_movie_franchise(meta, query_text)
         if q_fr and q_fr.lower() != "unknown":
             results = results[results["franchise"].str.strip().str.lower() == q_fr.lower()]
 
-    if safe_mode:
-        bad = ["nsfw","adult","porn","xxx","sex","erotic","babe"]
+    if safe_mode and not results.empty:
+        bad = ["nsfw", "adult", "porn", "xxx", "sex", "erotic", "babe"]
         pattern = "(?i)" + "|".join(bad)
         mask = pd.Series(False, index=results.index)
-        for col in ["genres","title","overview"]:
+        for col in ["genres", "title", "overview"]:
             if col in results.columns:
-                mask |= results[col].str.contains(pattern, na=False, regex=True)
+                mask |= results[col].astype(str).str.contains(pattern, na=False, regex=True)
         results = results.loc[~mask]
 
     if results.empty:
         return results
 
-    # --- Scoring (popularity + optional genre overlap) ---
-    base = _normalize(results["popularity"].to_numpy(dtype="float32")) if "popularity" in results.columns else np.zeros(len(results), dtype="float32")
-
-    genre_bonus = np.zeros(len(results), dtype="float32")
+    # --- GENRE = HARD THRESHOLD (>=2 overlaps), do it BEFORE scoring ---
     if use_genres and "genres" in results.columns:
         qg = _find_query_movie_genres(meta, query_text)
         if qg:
             qset = set(qg)
-            overlaps = []
-            for g in results["genres"].tolist():
-                rset = set(_split_genres(g))
-                overlaps.append(len(qset & rset))
-            overlaps = np.asarray(overlaps, dtype="float32")
-            genre_bonus = np.minimum(overlaps, 3.0) * 0.1
+            def _ov(g):
+                if isinstance(g, list):
+                    rset = set(g)
+                else:
+                    rset = set(_split_genres(str(g)))
+                return len(qset & rset)
+            results["genre_overlap"] = results["genres"].apply(_ov)
+            results = results[results["genre_overlap"] >= 2]
+            if results.empty:
+                return results
 
-    score = base + genre_bonus
+    # ---- Re-rank similarity for candidates ----
+    sims = None
+    try:
+        emb = load_embeddings(emb_name)
+        if emb is not None:
+            cand_vecs = emb[results.index.to_numpy()]
+            q = q_vec / (np.linalg.norm(q_vec) + 1e-12)
+            E = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
+            sims = (E @ q).astype("float32")
+    except Exception:
+        sims = None
+
+    if sims is None and "overview" in results.columns:
+        try:
+            cand_vecs = model.encode(results["overview"].fillna("").tolist()).astype("float32")
+            q = q_vec / (np.linalg.norm(q_vec) + 1e-12)
+            E = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
+            sims = (E @ q).astype("float32")
+        except Exception:
+            sims = None
+
+    if sims is None:
+        sims = np.zeros(len(results), dtype="float32")
+
+    # Normalize sims from [-1,1] -> [0,1] to mix with other [0,1] features
+    sims01 = (sims + 1.0) * 0.5
+    results["sim"] = sims01
+
+    # ---- Feature terms (all 0..1) ----
+    if "popularity" in results.columns:
+        pop_log = np.log1p(pd.to_numeric(results["popularity"], errors="coerce").fillna(0).to_numpy("float32"))
+        pop_log = pop_log / (pop_log.max() + 1e-6)
+    else:
+        pop_log = np.zeros(len(results), dtype="float32")
+
+    # For notebook parity: no soft genre bonus
+    genre_bonus = np.zeros(len(results), dtype="float32")
+
+    # Only compute franchise boost when the checkbox is ON (otherwise no soft effect)
+    fr_boost = np.zeros(len(results), dtype="float32")
+    if franchise_only and "franchise" in results.columns:
+        q_fr = _find_query_movie_franchise(meta, query_text)
+        if q_fr and q_fr.strip().lower() != "unknown":
+            fr_boost = (
+                results["franchise"].astype(str).str.strip().str.lower()
+                == q_fr.strip().lower()
+            ).to_numpy("bool").astype("float32")
+
+    # ---- Weights and final score ----
+    W_SIM, W_POP, W_GEN, W_FR = 0.70, 0.15, 0.00, 0.15
+    score = (
+        W_SIM * results["sim"].to_numpy("float32") +
+        W_POP * pop_log +
+        W_GEN * genre_bonus +
+        W_FR  * fr_boost
+    )
     results = results.assign(score=score).sort_values("score", ascending=False)
 
-    # --- Build poster_url if poster_path exists ---
+    # ---- Build poster_url for UI cards ----
     if "poster_path" in results.columns:
-        # ensure clean string and prepend TMDB base
         results["poster_url"] = results["poster_path"].astype(str).str.strip()
-        results.loc[results["poster_url"].str.len() > 0, "poster_url"] = \
-            TMDB_IMG_BASE + results.loc[results["poster_url"].str.len() > 0, "poster_url"]
-        # empty string stays empty; your card renderer will swap to placeholder
+        mask = results["poster_url"].str.len() > 0
+        results.loc[mask, "poster_url"] = TMDB_IMG_BASE + results.loc[mask, "poster_url"]
 
-    # --- Select columns for UI (keep extras if available) ---
-    base_keep = ["title", "genres", "popularity"]
-    if franchise_only:
-        base_keep = ["title", "genres", "franchise", "popularity"]
+    # ---- Return top-k with the columns the UI needs ----
+    base_cols = ["title", "genres", "popularity"]
+    if "franchise" in results.columns:
+        base_cols.append("franchise")
+    extras = [c for c in ["overview", "poster_path", "poster_url", "sim", "score"] if c in results.columns]
+    keep = [c for c in base_cols if c in results.columns] + extras
 
-    extras = [c for c in ["overview", "poster_path", "poster_url"] if c in results.columns]
-    keep = [c for c in base_keep if c in results.columns] + extras
-
-    out = results[keep].head(top_k).reset_index(drop=True)
-    return out
+    return results[keep].head(top_k).reset_index(drop=True)
 
 # ---------------- UI helpers ----------------
-def render_results_as_cards(df: pd.DataFrame):
+def render_results_as_cards(df: pd.DataFrame, show_franchise: bool = False):
     if df.empty:
         st.info("No results found.")
         return
@@ -443,7 +513,8 @@ def render_results_as_cards(df: pd.DataFrame):
             st.markdown(f"### {row.get('title','Untitled')}")
             if row.get("genres"):
                 st.caption(f"Genres: {row['genres']}")
-            if row.get("franchise"):
+            # show franchise ONLY if the toggle is on
+            if show_franchise and row.get("franchise"):
                 st.caption(f"🎬 Franchise: {row['franchise']}")
             if row.get("popularity") is not None:
                 st.caption(f"⭐ Popularity: {row['popularity']:.2f}")
@@ -488,7 +559,7 @@ with col2:
     use_genres = st.checkbox(
         "Use genres of query movie",
         value=False,
-        help="Softly boost results that share genres with your query movie (exact title searches work best)."
+        help="HARD filter: keep only results sharing at least 2 genres with the query (exact title works best)."
     )
 with col3:
     safe_mode = st.checkbox(
@@ -526,7 +597,7 @@ if st.button("Recommend"):
             st.info("No results. Try fewer filters or a different query.")
         else:
             # Posters + nice layout
-            render_results_as_cards(out)
+            render_results_as_cards(out, show_franchise=franchise_only)
 
 # Small footer
-st.markdown("<br><hr><center>Made with ❤️ by Mario</center>", unsafe_allow_html=True)
+st.markdown("<br><hr><center>Made by Mario</center>", unsafe_allow_html=True)
