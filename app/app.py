@@ -324,6 +324,8 @@ def load_embeddings(emb_name: Optional[str]) -> Optional[np.ndarray]:
         return None
 
 # ---------------- Search helpers ----------------
+TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
+
 def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int):
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     e = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
@@ -340,8 +342,8 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
     base_pool = POOL_WIDE if use_genres else POOL_BASE
     pool = int(min(POOL_MAX, max(base_pool, top_k * 10)))
 
+    # --- Retrieve candidate ids (FAISS -> cosine fallback) ---
     idx = None
-
     faiss_index = load_faiss(index_name)
     if faiss_index is not None:
         try:
@@ -367,18 +369,16 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
 
     results = meta.iloc[idx].copy()
 
-    # Remove exact self-match
+    # --- Post-filtering & safety ---
     q_lower = query_text.strip().lower()
     if "title" in results.columns and q_lower:
-        results = results[results["title"].str.lower() != q_lower]
+        results = results[results["title"].str.lower() != q_lower]  # remove exact self-match
 
-    # Optional franchise filter
     if franchise_only and "franchise" in results.columns:
         q_fr = _find_query_movie_franchise(meta, query_text)
         if q_fr and q_fr.lower() != "unknown":
             results = results[results["franchise"].str.strip().str.lower() == q_fr.lower()]
 
-    # Safe-mode filter
     if safe_mode:
         bad = ["nsfw","adult","porn","xxx","sex","erotic","babe"]
         pattern = "(?i)" + "|".join(bad)
@@ -391,7 +391,7 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
     if results.empty:
         return results
 
-    # Scoring: popularity + (optional) genre overlap bonus
+    # --- Scoring (popularity + optional genre overlap) ---
     base = _normalize(results["popularity"].to_numpy(dtype="float32")) if "popularity" in results.columns else np.zeros(len(results), dtype="float32")
 
     genre_bonus = np.zeros(len(results), dtype="float32")
@@ -409,46 +409,108 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
     score = base + genre_bonus
     results = results.assign(score=score).sort_values("score", ascending=False)
 
-    keep = [c for c in (["title","genres","franchise","popularity"] if franchise_only else ["title","genres","popularity"]) if c in results.columns]
-    if not keep:  # safety
-        keep = [c for c in ["title","genres","popularity"] if c in results.columns]
-    return results[keep].head(top_k)
+    # --- Build poster_url if poster_path exists ---
+    if "poster_path" in results.columns:
+        # ensure clean string and prepend TMDB base
+        results["poster_url"] = results["poster_path"].astype(str).str.strip()
+        results.loc[results["poster_url"].str.len() > 0, "poster_url"] = \
+            TMDB_IMG_BASE + results.loc[results["poster_url"].str.len() > 0, "poster_url"]
+        # empty string stays empty; your card renderer will swap to placeholder
+
+    # --- Select columns for UI (keep extras if available) ---
+    base_keep = ["title", "genres", "popularity"]
+    if franchise_only:
+        base_keep = ["title", "genres", "franchise", "popularity"]
+
+    extras = [c for c in ["overview", "poster_path", "poster_url"] if c in results.columns]
+    keep = [c for c in base_keep if c in results.columns] + extras
+
+    out = results[keep].head(top_k).reset_index(drop=True)
+    return out
+
+# ---------------- UI helpers ----------------
+def render_results_as_cards(df: pd.DataFrame):
+    if df.empty:
+        st.info("No results found.")
+        return
+
+    for _, row in df.iterrows():
+        poster_url = row.get("poster_url") or "https://via.placeholder.com/120x180?text=No+Image"
+        c1, c2 = st.columns([1, 5], vertical_alignment="center")
+        with c1:
+            st.image(poster_url, width=110)
+        with c2:
+            st.markdown(f"### {row.get('title','Untitled')}")
+            if row.get("genres"):
+                st.caption(f"Genres: {row['genres']}")
+            if row.get("franchise"):
+                st.caption(f"🎬 Franchise: {row['franchise']}")
+            if row.get("popularity") is not None:
+                st.caption(f"⭐ Popularity: {row['popularity']:.2f}")
+        st.divider()
 
 # ---------------- UI ----------------
-mode_badge = {"lite": "(Lite index)", "full": "(Full index)", "auto": "(Auto mode)"}.get(MODE, "")
-st.title(f"🎬 Movie Recommender {mode_badge}")
+st.title("🎬 Mario's Netflix")
+
+# Friendly intro for end-users
 st.caption(
-    "Search by movie name or short description. "
-    "In *auto* mode the app tries the lite artifact names first (best for Cloud) "
-    "and falls back to full names if they aren't present."
+    "Looking for your next favorite movie? Type a title or describe what you want to watch, "
+    "and we’ll suggest the best matches — from classics to hidden gems. "
+    "_Tip: Genre filters only work when you search by an exact movie title._"
 )
 
-# Resolve which files to use (AFTER set_page_config)
-PARQUET_FILE, INDEX_FILE, EMB_FILE = _choose_files()
+# Keep developer info out of the way but accessible
+with st.expander("Technical info"):
+    st.write(f"Mode: {MODE}")
+    st.write(f"Repo: {HF_REPO_ID}")
+    st.write(f"Parquet: {PARQUET_FILE}")
+    st.write(f"Index: {INDEX_FILE}")
+    st.write(f"Embeddings: {EMB_FILE if LOAD_EMB else 'Disabled'}")
 
-# Show exactly what repo+files are being used (helps verify on Cloud)
-st.caption(f"Using HF repo: {HF_REPO_ID} · parquet: {PARQUET_FILE} · index: {INDEX_FILE}")
+# ---- Sections: Search / Filters / Results ----
+st.subheader("🔍 Search")
+query = st.text_input("Title or description", placeholder="e.g., Interstellar — gritty space survival")
 
-query = st.text_input("Search", placeholder="e.g., Interstellar — gritty space survival")
-col_left, col_right = st.columns([2, 1])
-with col_left:
-    a, b = st.columns(2)
-    with a:
-        franchise_only = st.checkbox("Filter by franchise", value=False)
-    with b:
-        use_genres = st.checkbox("Use genres of query movie", value=False)
-with col_right:
-    safe_mode = st.checkbox("Safe mode (hide NSFW)", value=True)
+st.divider()
 
-top_k = st.slider("How many recommendations?", 5, 50, 5, 5)
+st.subheader("⚙️ Filters")
+col1, col2, col3 = st.columns(3)
+with col1:
+    franchise_only = st.checkbox(
+        "Filter by franchise",
+        value=False,
+        help="Only show results from the same franchise as the query movie."
+    )
+with col2:
+    use_genres = st.checkbox(
+        "Use genres of query movie",
+        value=False,
+        help="Softly boost results that share genres with your query movie (exact title searches work best)."
+    )
+with col3:
+    safe_mode = st.checkbox(
+        "Safe mode (hide NSFW)",
+        value=True,
+        help="Hide adult/NSFW content from results."
+    )
+
+top_k = st.slider(
+    "How many recommendations?",
+    min_value=5, max_value=50, value=10, step=5,
+    help="More items may be a bit slower."
+)
+
+st.divider()
+
+st.subheader("🎯 Recommendations")
 
 if st.button("Recommend"):
     if not query.strip():
-        st.warning("Please enter a query.")
+        st.warning("Please enter a title or short description.")
     else:
-        with st.spinner("Searching…"):
+        with st.spinner("🔎 Finding great matches…"):
             out = run_search(
-                parquet_name=PARQUET_FILE,   # <- correct var name
+                parquet_name=PARQUET_FILE,
                 index_name=INDEX_FILE,
                 emb_name=EMB_FILE,
                 query_text=query.strip(),
@@ -458,7 +520,10 @@ if st.button("Recommend"):
                 top_k=top_k,
             )
         if out.empty:
-            st.info("No results. Try fewer filters or ensure your FAISS index exists in the HF dataset.")
+            st.info("No results. Try fewer filters or a different query.")
         else:
-            st.subheader(f"Top {top_k}")
-            st.dataframe(out, use_container_width=True)
+            # Posters + nice layout
+            render_results_as_cards(out)
+
+# Small footer
+st.markdown("<br><hr><center>Made with ❤️ by Mario</center>", unsafe_allow_html=True)
