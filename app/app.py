@@ -1,4 +1,13 @@
+# app/app.py
+# -----------------------------------------
+# Movie Recommender (Cloud-optimized)
+# -----------------------------------------
+
+# Make sure Cloud doesn't try to use CUDA or spawn too many tokenizer threads
 import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import difflib
 from typing import List, Optional
 
@@ -16,30 +25,42 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
-# ---------------- Config ---------------
-# Hugging Face model & dataset
-MODEL_ID     = "Mariodb/movie-recommender-model"     # your fine-tuned SBERT
-HF_REPO_ID   = "Mariodb/movie-recommender-dataset"   # dataset repo
-HF_REPO_TYPE = "dataset"
-HF_DF_FILE   = "movies.parquet"                      # metadata
-HF_IDX_FILE  = "movie_index.faiss"                   # FAISS
-HF_EMB_FILE  = "movie_embeddings.npy"                # embeddings
+# ---------------- Config (env-overridable) ---------------
+# Model & dataset locations on Hugging Face
+MODEL_ID      = os.getenv("MODEL_ID", "Mariodb/movie-recommender-model")
 
-# Local fallbacks (used only if HF fetch fails)
-DATA_CSV   = "data/movies.csv"
-FAISS_PATH = "indexes/movie_index.faiss"
-EMB_PATH   = "artifacts/movie_embeddings.npy"
+HF_REPO_ID    = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset")
+HF_REPO_TYPE  = os.getenv("HF_REPO_TYPE", "dataset")
 
-POOL_BASE = 50
-POOL_WIDE = 300
-POOL_MAX  = 1000
+# Default to compact artifacts suitable for small containers
+HF_DF_FILE    = os.getenv("HF_DF_FILE",  "movies_compact.parquet")     # or movies_lite.parquet
+HF_IDX_FILE   = os.getenv("HF_IDX_FILE", "movie_index_ivfpq.faiss")    # or movie_index_lite.faiss
+HF_EMB_FILE   = os.getenv("HF_EMB_FILE", "movie_embeddings_lite.npy")  # not used by default
 
-# Try FAISS; fall back to cosine if missing
+# Local fallbacks (used only if HF fetch fails AND files exist)
+DATA_CSV      = os.getenv("DATA_CSV",   "data/movies.csv")
+FAISS_PATH    = os.getenv("FAISS_PATH", "indexes/movie_index_ivfpq.faiss")
+EMB_PATH      = os.getenv("EMB_PATH",   "artifacts/movie_embeddings.npy")
+
+# Pool sizes (keep conservative for Cloud)
+POOL_BASE = int(os.getenv("POOL_BASE", "50"))
+POOL_WIDE = int(os.getenv("POOL_WIDE", "300"))
+POOL_MAX  = int(os.getenv("POOL_MAX",  "500"))
+
+# Toggle for loading embeddings as a last resort (DISABLED by default on Cloud)
+LOAD_EMB = os.getenv("LOAD_EMB", "0") == "1"
+
+# Try FAISS; keep CPU usage low
+FAISS_OK = False
 try:
     import faiss
     FAISS_OK = True
+    try:
+        faiss.omp_set_num_threads(1)  # avoid CPU spikes on small machines
+    except Exception:
+        pass
 except Exception:
-    FAISS_OK = False
+    pass
 
 # ---------------- Small helpers ----------------
 def _split_genres(s: str) -> List[str]:
@@ -207,8 +228,9 @@ def _hf_path(filename: str) -> str:
 def _download_df_from_hf() -> pd.DataFrame:
     local_path = _hf_path(HF_DF_FILE)
     if HF_DF_FILE.endswith(".parquet"):
-        return pd.read_parquet(local_path)
-    return pd.read_csv(local_path)
+        use_cols = ["title","overview","genres","franchise","popularity"]
+        return pd.read_parquet(local_path, columns=use_cols)
+    return pd.read_csv(local_path, usecols=["title","overview","genres","franchise","popularity"])
 
 # ---------------- Cached loaders ----------------
 @st.cache_resource
@@ -244,24 +266,36 @@ def load_metadata() -> pd.DataFrame:
 def load_faiss():
     """Read FAISS index via memory-mapping to reduce RAM usage."""
     if not FAISS_OK:
+        st.warning("FAISS is not available in this environment. Search will be disabled.")
         return None
     try:
         path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(HF_IDX_FILE)
-        # Memory-map instead of loading entirely into RAM
-        return faiss.read_index(path, faiss.IO_FLAG_MMAP)
-    except Exception:
-        # Any failure -> fall back to cosine later
+        index = faiss.read_index(path, faiss.IO_FLAG_MMAP)
+        # If IVF family, set a reasonable nprobe
+        try:
+            index.nprobe = int(os.getenv("FAISS_NPROBE", "16"))
+        except Exception:
+            pass
+        return index
+    except Exception as e:
+        st.error(f"FAISS load failed: {e}")
         return None
 
 @st.cache_resource
 def load_embeddings() -> Optional[np.ndarray]:
-    """Read embeddings (memory-mapped). Used only if FAISS is unavailable."""
+    """
+    Disabled by default on Cloud to avoid OOM.
+    Enable by setting LOAD_EMB=1 and ensuring EMB_PATH/HF_EMB_FILE exists.
+    """
+    if not LOAD_EMB:
+        return None
     try:
         path = EMB_PATH if os.path.exists(EMB_PATH) else _hf_path(HF_EMB_FILE)
         if not os.path.exists(path):
             return None
         return np.load(path, mmap_mode="r")
-    except Exception:
+    except Exception as e:
+        st.warning(f"Embeddings fallback not available: {e}")
         return None
 
 # ---------------- Search helpers ----------------
@@ -289,16 +323,24 @@ def run_search(query_text: str, franchise_only: bool, safe_mode: bool, use_genre
             q = q_vec / (np.linalg.norm(q_vec) + 1e-12)
             D, I = faiss_index.search(q[None, :], pool)
             idx = I[0]
-        except Exception:
+            # Filter out possible -1 entries (IVF edge cases)
+            if idx is not None:
+                idx = idx[idx >= 0]
+        except Exception as e:
+            st.warning(f"FAISS search failed (fallback only if embeddings are enabled): {e}")
             idx = None  # fall back below
 
-    # Cosine fallback (embeddings are memory-mapped)
-    if idx is None:
+    # Cosine fallback (disabled by default on Cloud)
+    if idx is None or len(idx) == 0:
         emb = load_embeddings()
         if emb is None:
-            st.error("No FAISS index or embeddings fallback found. Add one of them (prefer memory-mapped FAISS).")
+            st.error("Search index unavailable. Please enable FAISS or local embeddings.")
             return pd.DataFrame()
         idx, _ = cosine_topk(q_vec, emb, pool)
+
+    # Guard: if still empty
+    if idx is None or len(idx) == 0:
+        return pd.DataFrame()
 
     results = meta.iloc[idx].copy()
 
@@ -355,13 +397,13 @@ def run_search(query_text: str, franchise_only: bool, safe_mode: bool, use_genre
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="Movie Recommender", layout="wide")
-st.title("🎬 Movie Recommender")
+st.title("🎬 Movie Recommender (Cloud-optimized)")
 
 st.write(
     "Type a **movie name** or a short **description**. "
     "If you enable *Use genres of query movie*, the app will look up the movie's genres "
     "and softly boost results that share them. If the movie has no genres, search runs normally. "
-    "Same goes for the *franchise filter*."
+    "Use the *franchise filter* to only show items from the same franchise as the query movie."
 )
 
 query = st.text_input("Search", placeholder="e.g., Interstellar  •  gritty space survival")
@@ -395,7 +437,7 @@ if st.button("Recommend"):
                 top_k=top_k,
             )
         if out.empty:
-            st.info("No results. Try fewer filters.")
+            st.info("No results. Try fewer filters or ensure the FAISS index is available.")
         else:
             st.subheader(f"Top {top_k}")
             st.dataframe(out, use_container_width=True)
