@@ -1,15 +1,17 @@
 # app/app.py
 # =========================================
 # Movie Recommender — dual-mode (Cloud + Local), Py3.8-safe
+# Uses your HF files:
+#   movies.parquet, movie_index.faiss, movie_embeddings.npy
 # =========================================
 
 import os
 
-# ---- Streamlit must be first command ----
+# ---- Streamlit MUST be the first command used ----
 import streamlit as st
 st.set_page_config(page_title="Movie Recommender", layout="wide")
 
-# Environment safety & tokenizer threads
+# Keep Cloud safe (no CUDA) and avoid noisy tokenizer threads
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -27,41 +29,42 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 # ---------------- Mode / config (env-overridable) ----------------
 # MODE = auto | lite | full
-MODE = os.getenv("MODE", "auto").lower()
-LOAD_EMB = os.getenv("LOAD_EMB", "0") == "1"  # rarely needed online
+MODE = os.getenv("MODE", "auto").lower().strip()
+LOAD_EMB = os.getenv("LOAD_EMB", "0") == "1"  # embeddings fallback (off by default)
 
-# HF dataset repo (same for both modes)
-HF_REPO_ID   = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset")
-HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset")
+# Hugging Face dataset repo
+HF_REPO_ID   = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset").strip()
+HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset").strip()
+HF_REVISION  = os.getenv("HF_REVISION", "main").strip()
 
-# Filenames in the HF repo
-LITE_PARQUET = os.getenv("LITE_PARQUET", "movies_compact.parquet")
-LITE_INDEX   = os.getenv("LITE_INDEX",   "movie_index_ivfpq.faiss")
+# Filenames in your HF repo (you showed these names)
+LITE_PARQUET = os.getenv("LITE_PARQUET", "movies.parquet").strip()
+LITE_INDEX   = os.getenv("LITE_INDEX",   "movie_index.faiss").strip()
 
-FULL_PARQUET = os.getenv("FULL_PARQUET", "movies.parquet")
-FULL_INDEX   = os.getenv("FULL_INDEX",   "movie_index.faiss")
-FULL_EMB     = os.getenv("FULL_EMB",     "movie_embeddings.npy")  # optional
+FULL_PARQUET = os.getenv("FULL_PARQUET", "movies.parquet").strip()
+FULL_INDEX   = os.getenv("FULL_INDEX",   "movie_index.faiss").strip()
+FULL_EMB     = os.getenv("FULL_EMB",     "movie_embeddings.npy").strip()
 
-# Local fallbacks (if HF fetch fails AND files exist locally)
+# Local fallbacks (used only if HF fetch fails AND files exist locally)
 DATA_CSV   = os.getenv("DATA_CSV",   "data/movies.csv")
-FAISS_PATH = os.getenv("FAISS_PATH", "indexes/movie_index_ivfpq.faiss")
+FAISS_PATH = os.getenv("FAISS_PATH", "indexes/movie_index.faiss")
 EMB_PATH   = os.getenv("EMB_PATH",   "artifacts/movie_embeddings.npy")
 
 # Model
-MODEL_ID = os.getenv("MODEL_ID", "Mariodb/movie-recommender-model")
+MODEL_ID = os.getenv("MODEL_ID", "Mariodb/movie-recommender-model").strip()
 
 # Pools (Cloud-friendly defaults)
 POOL_BASE = int(os.getenv("POOL_BASE", "50"))
 POOL_WIDE = int(os.getenv("POOL_WIDE", "300"))
 POOL_MAX  = int(os.getenv("POOL_MAX",  "500"))
 
-# FAISS availability (import after set_page_config)
+# FAISS availability
 FAISS_OK = False
 try:
     import faiss
     FAISS_OK = True
     try:
-        faiss.omp_set_num_threads(1)
+        faiss.omp_set_num_threads(1)  # avoid CPU spikes on small machines
     except Exception:
         pass
 except Exception:
@@ -197,44 +200,28 @@ def _find_query_movie_franchise(df: pd.DataFrame, query_text: str) -> str:
 # ---------------- HF helpers ----------------
 @st.cache_data
 def _hf_path(filename: str) -> str:
-    """Download a single file from the HF dataset repo and return local cache path."""
+    """Download a file from the HF dataset repo (trims env vars; supports revision)."""
     return hf_hub_download(
         repo_id=HF_REPO_ID,
         filename=filename,
         repo_type=HF_REPO_TYPE,
+        revision=HF_REVISION,
         local_dir="data",
         local_dir_use_symlinks=False,
+        # token=os.getenv("HF_TOKEN")  # uncomment if your repo is private
     )
 
 def _choose_files() -> Tuple[str, str, Optional[str]]:
     """
-    Decide which artifacts to use (lite vs full).
-    We do this at runtime (after set_page_config) to satisfy Streamlit's ordering rule.
+    Decide which artifacts to use (lite vs full) WITHOUT pre-downloading.
+    We try lite first during load; on 404 we fall back to full automatically.
     """
-    def exists_on_hf(name: str) -> bool:
-        try:
-            _ = _hf_path(name)   # will download or hit cache
-            return True
-        except Exception:
-            return False
-
     if MODE == "lite":
         return (LITE_PARQUET, LITE_INDEX, None)
     if MODE == "full":
         return (FULL_PARQUET, FULL_INDEX, FULL_EMB if LOAD_EMB else None)
-
-    # MODE == auto: prefer lite if both files exist, else fall back to full
-    if exists_on_hf(LITE_PARQUET) and exists_on_hf(LITE_INDEX):
-        return (LITE_PARQUET, LITE_INDEX, None)
-    return (FULL_PARQUET, FULL_INDEX, FULL_EMB if LOAD_EMB else None)
-
-@st.cache_data
-def _download_df_from_hf(parquet_name: str) -> pd.DataFrame:
-    path = _hf_path(parquet_name)
-    if parquet_name.endswith(".parquet"):
-        use_cols = ["title","overview","genres","franchise","popularity"]
-        return pd.read_parquet(path, columns=[c for c in use_cols if c])
-    return pd.read_csv(path, usecols=["title","overview","genres","franchise","popularity"])
+    # auto
+    return (LITE_PARQUET, LITE_INDEX, None)
 
 # ---------------- Cached loaders ----------------
 @st.cache_resource
@@ -243,45 +230,85 @@ def load_model():
 
 @st.cache_resource
 def load_metadata(parquet_name: str) -> pd.DataFrame:
-    try:
-        df = _download_df_from_hf(parquet_name)
-    except Exception as e:
-        # local fallback
-        if os.path.exists(DATA_CSV):
-            df = pd.read_csv(DATA_CSV)
-        else:
-            st.error(
-                "Couldn't fetch dataset from Hugging Face and no local CSV found.\n\n"
-                "Tried: {}/{} and {}\n\nError: {}".format(HF_REPO_ID, parquet_name, DATA_CSV, e)
-            )
-            st.stop()
+    def _load_one(name: str) -> pd.DataFrame:
+        path = _hf_path(name)
+        return pd.read_parquet(path)
 
-    for col in ["title","overview","genres","franchise"]:
+    try:
+        df = _load_one(parquet_name)
+    except Exception as e:
+        msg = str(e).lower()
+        if ("404" in msg or "entry not found" in msg) and parquet_name != FULL_PARQUET:
+            try:
+                df = _load_one(FULL_PARQUET)  # fallback to full name
+            except Exception as e2:
+                if os.path.exists(DATA_CSV):
+                    df = pd.read_csv(DATA_CSV)
+                else:
+                    st.error(
+                        f"Couldn't fetch dataset from Hugging Face and no local CSV found.\n\n"
+                        f"Tried: {HF_REPO_ID}/{parquet_name} then {HF_REPO_ID}/{FULL_PARQUET} and {DATA_CSV}\n\n"
+                        f"Error: {e2}"
+                    )
+                    st.stop()
+        else:
+            if os.path.exists(DATA_CSV):
+                df = pd.read_csv(DATA_CSV)
+            else:
+                st.error(
+                    f"Couldn't fetch dataset from Hugging Face and no local CSV found.\n\n"
+                    f"Tried: {HF_REPO_ID}/{parquet_name} and {DATA_CSV}\n\nError: {e}"
+                )
+                st.stop()
+
+    # Normalize columns we use
+    for col in ["title", "overview", "genres", "franchise"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
     if "popularity" in df.columns:
         df["popularity"] = pd.to_numeric(df["popularity"], errors="coerce").fillna(0.0)
     if "genres" in df.columns:
         df["genres"] = df["genres"].apply(lambda s: "" if str(s).strip().lower() == "unknown" else s)
-    return _ensure_franchise(df)
+
+    # Ensure franchise column
+    df = _ensure_franchise(df)
+
+    # If some columns are missing, create them so UI doesn't crash
+    for col in ["title", "genres", "franchise", "popularity", "overview"]:
+        if col not in df.columns:
+            df[col] = "" if col != "popularity" else 0.0
+
+    return df
 
 @st.cache_resource
 def load_faiss(index_name: str):
     if not FAISS_OK:
         st.warning("FAISS is not available; will use embeddings only if enabled.")
         return None
-    try:
-        # HF first, then local fallback
-        path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(index_name)
-        index = faiss.read_index(path, faiss.IO_FLAG_MMAP)
+
+    def _load_one(name: str):
+        # Use local path if present, otherwise fetch from HF
+        path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(name)
+        idx = faiss.read_index(path, faiss.IO_FLAG_MMAP)  # mmap to avoid huge RAM
         try:
-            index.nprobe = int(os.getenv("FAISS_NPROBE", "16"))
+            idx.nprobe = int(os.getenv("FAISS_NPROBE", "16"))  # good default for IVF
         except Exception:
             pass
-        return index
+        return idx
+
+    try:
+        return _load_one(index_name)
     except Exception as e:
-        st.error("FAISS load failed: {}".format(e))
-        return None
+        msg = str(e).lower()
+        if ("404" in msg or "entry not found" in msg) and index_name != FULL_INDEX:
+            try:
+                return _load_one(FULL_INDEX)  # fallback to full name
+            except Exception as e2:
+                st.error(f"FAISS load failed (tried {index_name} then {FULL_INDEX}): {e2}")
+                return None
+        else:
+            st.error(f"FAISS load failed: {e}")
+            return None
 
 @st.cache_resource
 def load_embeddings(emb_name: Optional[str]) -> Optional[np.ndarray]:
@@ -293,7 +320,7 @@ def load_embeddings(emb_name: Optional[str]) -> Optional[np.ndarray]:
             return None
         return np.load(path, mmap_mode="r")
     except Exception as e:
-        st.warning("Embeddings fallback not available: {}".format(e))
+        st.warning(f"Embeddings fallback not available: {e}")
         return None
 
 # ---------------- Search helpers ----------------
@@ -322,16 +349,16 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
             D, I = faiss_index.search(q[None, :], pool)
             idx = I[0]
             if idx is not None:
-                idx = idx[idx >= 0]
+                idx = idx[idx >= 0]  # guard against -1 entries
         except Exception as e:
-            st.warning("FAISS search failed; will try embeddings if enabled. Error: {}".format(e))
+            st.warning(f"FAISS search failed; will try embeddings if enabled. Error: {e}")
             idx = None
 
     if idx is None or len(idx) == 0:
         emb = load_embeddings(emb_name)
         if emb is None:
             st.error("Search index unavailable (no FAISS / embeddings). "
-                     "Upload lite/full index to HF or enable embeddings locally.")
+                     "Upload index to HF or enable embeddings locally with LOAD_EMB=1.")
             return pd.DataFrame()
         idx, _ = cosine_topk(q_vec, emb, pool)
 
@@ -340,15 +367,18 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
 
     results = meta.iloc[idx].copy()
 
+    # Remove exact self-match
     q_lower = query_text.strip().lower()
     if "title" in results.columns and q_lower:
         results = results[results["title"].str.lower() != q_lower]
 
+    # Optional franchise filter
     if franchise_only and "franchise" in results.columns:
         q_fr = _find_query_movie_franchise(meta, query_text)
         if q_fr and q_fr.lower() != "unknown":
             results = results[results["franchise"].str.strip().str.lower() == q_fr.lower()]
 
+    # Safe-mode filter
     if safe_mode:
         bad = ["nsfw","adult","porn","xxx","sex","erotic","babe"]
         pattern = "(?i)" + "|".join(bad)
@@ -361,6 +391,7 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
     if results.empty:
         return results
 
+    # Scoring: popularity + (optional) genre overlap bonus
     base = _normalize(results["popularity"].to_numpy(dtype="float32")) if "popularity" in results.columns else np.zeros(len(results), dtype="float32")
 
     genre_bonus = np.zeros(len(results), dtype="float32")
@@ -377,20 +408,26 @@ def run_search(parquet_name: str, index_name: str, emb_name: Optional[str],
 
     score = base + genre_bonus
     results = results.assign(score=score).sort_values("score", ascending=False)
+
     keep = [c for c in (["title","genres","franchise","popularity"] if franchise_only else ["title","genres","popularity"]) if c in results.columns]
+    if not keep:  # safety
+        keep = [c for c in ["title","genres","popularity"] if c in results.columns]
     return results[keep].head(top_k)
 
 # ---------------- UI ----------------
 mode_badge = {"lite": "(Lite index)", "full": "(Full index)", "auto": "(Auto mode)"}.get(MODE, "")
-st.title("🎬 Movie Recommender {}".format(mode_badge))
+st.title(f"🎬 Movie Recommender {mode_badge}")
 st.caption(
     "Search by movie name or short description. "
-    "In *auto* mode the app uses lite artifacts if available (best for Cloud), "
-    "otherwise uses full artifacts (best for local)."
+    "In *auto* mode the app tries the lite artifact names first (best for Cloud) "
+    "and falls back to full names if they aren't present."
 )
 
 # Resolve which files to use (AFTER set_page_config)
 PARQUET_FILE, INDEX_FILE, EMB_FILE = _choose_files()
+
+# Show exactly what repo+files are being used (helps verify on Cloud)
+st.caption(f"Using HF repo: {HF_REPO_ID} · parquet: {PARQUET_FILE} · index: {INDEX_FILE}")
 
 query = st.text_input("Search", placeholder="e.g., Interstellar — gritty space survival")
 col_left, col_right = st.columns([2, 1])
@@ -411,7 +448,7 @@ if st.button("Recommend"):
     else:
         with st.spinner("Searching…"):
             out = run_search(
-                parquet_name=PARQUET_FILE,
+                parquet_name=PARQUET_FILE,   # <- correct var name
                 index_name=INDEX_FILE,
                 emb_name=EMB_FILE,
                 query_text=query.strip(),
@@ -421,7 +458,7 @@ if st.button("Recommend"):
                 top_k=top_k,
             )
         if out.empty:
-            st.info("No results. Try fewer filters or ensure your FAISS index files exist in the HF dataset.")
+            st.info("No results. Try fewer filters or ensure your FAISS index exists in the HF dataset.")
         else:
-            st.subheader("Top {}".format(top_k))
+            st.subheader(f"Top {top_k}")
             st.dataframe(out, use_container_width=True)
