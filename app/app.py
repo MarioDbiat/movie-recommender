@@ -449,6 +449,9 @@ def render_results_as_cards(df: pd.DataFrame):
                 st.caption(f"⭐ Popularity: {row['popularity']:.2f}")
         st.divider()
 
+# Pick which files to use (lite/full/auto) BEFORE the UI
+PARQUET_FILE, INDEX_FILE, EMB_FILE = _choose_files()
+
 # ---------------- UI ----------------
 st.title("🎬 Mario's Netflix")
 
