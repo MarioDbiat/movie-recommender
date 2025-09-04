@@ -8,15 +8,13 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import hf_hub_download
 
-# ---------------- Optional: quiet a couple of noisy warnings ----------------
+# ---------------- Warnings ----------------
 import warnings
-warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 warnings.filterwarnings(
     "ignore",
-    message="`local_dir_use_symlinks` parameter is deprecated",
-    category=UserWarning,
-    module="huggingface_hub.file_download",
+    message="You are using `torch.load` with `weights_only=False`",
 )
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 # ---------------- Config ---------------
 # Hugging Face model & dataset
@@ -194,23 +192,18 @@ def _find_query_movie_franchise(df: pd.DataFrame, query_text: str) -> str:
     return ""
 
 # ---------------- HF download helpers ----------------
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def _hf_path(filename: str) -> str:
-    """
-    Download a single file from the HF dataset repo and return local path.
-    Uses ./data as the destination (no deprecated symlink arg).
-    """
-    local_path = os.path.join("data", filename)
-    if os.path.exists(local_path):
-        return local_path
+    """Download a single file from the HF dataset repo and return local cache path."""
     return hf_hub_download(
         repo_id=HF_REPO_ID,
         filename=filename,
         repo_type=HF_REPO_TYPE,
         local_dir="data",
+        local_dir_use_symlinks=False
     )
 
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def _download_df_from_hf() -> pd.DataFrame:
     local_path = _hf_path(HF_DF_FILE)
     if HF_DF_FILE.endswith(".parquet"):
@@ -218,11 +211,11 @@ def _download_df_from_hf() -> pd.DataFrame:
     return pd.read_csv(local_path)
 
 # ---------------- Cached loaders ----------------
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_model():
     return SentenceTransformer(MODEL_ID)
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_metadata() -> pd.DataFrame:
     try:
         df = _download_df_from_hf()
@@ -236,7 +229,6 @@ def load_metadata() -> pd.DataFrame:
             )
             st.stop()
 
-    # Normalize expected columns
     for col in ["title", "overview", "genres", "franchise"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
@@ -245,30 +237,31 @@ def load_metadata() -> pd.DataFrame:
     if "genres" in df.columns:
         df["genres"] = df["genres"].apply(lambda s: "" if str(s).strip().lower() == "unknown" else s)
 
-    return _ensure_franchise(df)
+    df = _ensure_franchise(df)
+    return df
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_faiss():
-    """Read FAISS index. Prefer local path; otherwise pull from HF. Fail soft."""
+    """Read FAISS index via memory-mapping to reduce RAM usage."""
     if not FAISS_OK:
         return None
     try:
         path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(HF_IDX_FILE)
-        return faiss.read_index(path)
-    except Exception as e:
-        st.warning(f"FAISS index couldn’t be loaded, falling back to embeddings. Details: {e}")
+        # Memory-map instead of loading entirely into RAM
+        return faiss.read_index(path, faiss.IO_FLAG_MMAP)
+    except Exception:
+        # Any failure -> fall back to cosine later
         return None
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_embeddings() -> Optional[np.ndarray]:
-    """Read embeddings. Prefer local path; otherwise pull from HF (mmap to save RAM)."""
-    path = EMB_PATH if os.path.exists(EMB_PATH) else _hf_path(HF_EMB_FILE)
-    if not os.path.exists(path):
-        return None
+    """Read embeddings (memory-mapped). Used only if FAISS is unavailable."""
     try:
+        path = EMB_PATH if os.path.exists(EMB_PATH) else _hf_path(HF_EMB_FILE)
+        if not os.path.exists(path):
+            return None
         return np.load(path, mmap_mode="r")
-    except Exception as e:
-        st.warning(f"Embeddings couldn’t be loaded: {e}")
+    except Exception:
         return None
 
 # ---------------- Search helpers ----------------
@@ -287,15 +280,23 @@ def run_search(query_text: str, franchise_only: bool, safe_mode: bool, use_genre
     base_pool = POOL_WIDE if use_genres else POOL_BASE
     pool = int(min(POOL_MAX, max(base_pool, top_k * 10)))
 
+    idx = None
+
+    # Try FAISS first
     faiss_index = load_faiss()
     if faiss_index is not None:
-        q = q_vec / (np.linalg.norm(q_vec) + 1e-12)
-        D, I = faiss_index.search(q[None, :], pool)
-        idx = I[0]
-    else:
+        try:
+            q = q_vec / (np.linalg.norm(q_vec) + 1e-12)
+            D, I = faiss_index.search(q[None, :], pool)
+            idx = I[0]
+        except Exception:
+            idx = None  # fall back below
+
+    # Cosine fallback (embeddings are memory-mapped)
+    if idx is None:
         emb = load_embeddings()
         if emb is None:
-            st.error("No FAISS index or embeddings fallback found. Add one of them.")
+            st.error("No FAISS index or embeddings fallback found. Add one of them (prefer memory-mapped FAISS).")
             return pd.DataFrame()
         idx, _ = cosine_topk(q_vec, emb, pool)
 
@@ -310,7 +311,7 @@ def run_search(query_text: str, franchise_only: bool, safe_mode: bool, use_genre
         if q_fr and q_fr.lower() != "unknown" and "franchise" in results.columns:
             results = results[results["franchise"].str.strip().str.lower() == q_fr.lower()]
 
-    if safe_mode and not results.empty:
+    if safe_mode:
         bad_words = ["nsfw", "adult", "porn", "xxx", "sex", "erotic", "babe"]
         pattern = "(?i)" + "|".join(bad_words)
         mask = pd.Series(False, index=results.index)
@@ -363,9 +364,6 @@ st.write(
     "Same goes for the *franchise filter*."
 )
 
-# Little debug switch to show tracebacks in the UI instead of a blank 'Oh no.'
-DEBUG = st.sidebar.toggle("Show debug tracebacks", False)
-
 query = st.text_input("Search", placeholder="e.g., Interstellar  •  gritty space survival")
 
 col_left, col_right = st.columns([2, 1])
@@ -389,23 +387,15 @@ if st.button("Recommend"):
         st.warning("Please enter a query.")
     else:
         with st.spinner("Searching…"):
-            try:
-                out = run_search(
-                    query_text=query.strip(),
-                    franchise_only=franchise_only,
-                    safe_mode=safe_mode,
-                    use_genres=use_genres,
-                    top_k=top_k,
-                )
-            except Exception as e:
-                if DEBUG:
-                    st.exception(e)
-                else:
-                    st.error("The app encountered an error while searching. Enable 'Show debug tracebacks' in the sidebar to see details.")
-                out = pd.DataFrame()
-
-        if out.empty and query.strip():
+            out = run_search(
+                query_text=query.strip(),
+                franchise_only=franchise_only,
+                safe_mode=safe_mode,
+                use_genres=use_genres,
+                top_k=top_k,
+            )
+        if out.empty:
             st.info("No results. Try fewer filters.")
-        elif not out.empty:
+        else:
             st.subheader(f"Top {top_k}")
             st.dataframe(out, use_container_width=True)
