@@ -1,7 +1,8 @@
-# app/Application.py
+# app/ApplicationFix.py
 # =========================================
-# Movie Recommender — Streamlit app (popularity toggle + safe fixes)
+# Movie Recommender — Streamlit app
 # Hugging Face–aware loaders (parquet / faiss / npy)
+# FAISS-preferred (skip embeddings.npy if FAISS is available)
 # =========================================
 
 # --- Streamlit must be configured first ---
@@ -52,6 +53,9 @@ HF_REPO_ID   = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset").stri
 HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset").strip()
 HF_REVISION  = os.getenv("HF_REVISION", "main").strip()
 HF_TOKEN     = os.getenv("HF_TOKEN")  # optional; needed only if repo is private
+
+# Optional: force FAISS-only scoring (never load .npy)
+FORCE_FAISS_ONLY = os.getenv("FORCE_FAISS_ONLY", "1").strip() == "1"
 
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
 
@@ -339,13 +343,18 @@ def run_search(
     df = load_metadata(parquet_name)
     model = load_model()
     index_obj = load_faiss(index_name)
-    embeddings = load_embeddings(emb_name or "")
 
-    if embeddings is None:
-        st.error("Embeddings file is required for scoring. Make sure EMB_FILE points to a valid .npy (local or on Hugging Face).")
+    # 👉 Prefer FAISS. Only load embeddings if FAISS is not available (or forced off).
+    embeddings = None
+    if (index_obj is None) and (not FORCE_FAISS_ONLY):
+        embeddings = load_embeddings(emb_name or "")
+
+    if index_obj is None and embeddings is None:
+        st.error("Need either a FAISS index or an embeddings .npy to score.")
         return pd.DataFrame()
 
-    if len(df) != len(embeddings):
+    # If using NPY path, shapes must align
+    if embeddings is not None and len(df) != len(embeddings):
         st.error("Embeddings and metadata shapes do not align.")
         return pd.DataFrame()
 
@@ -378,34 +387,42 @@ def run_search(
     fanout = choose_pool(top_k, use_genres)
 
     candidate_idx = None
+    sims = None
+
     if index_obj is not None:
         try:
-            _, idxs = index_obj.search(query_np, fanout)
+            # Expect FAISS index built for cosine/inner-product search; D ~ similarity
+            faiss_sims, idxs = index_obj.search(query_np, fanout)
             candidate_idx = idxs[0]
+            sims = faiss_sims[0].astype("float32")
         except Exception as exc:
             st.warning(f"FAISS search failed ({exc}); falling back to cosine search.")
             candidate_idx = None
+            sims = None
 
-    if candidate_idx is None or len(candidate_idx) == 0:
+    if (candidate_idx is None or len(candidate_idx) == 0) and embeddings is not None:
+        # cosine over embeddings (fallback)
         query_vec_np = query_np[0]
         emb_norms = np.linalg.norm(embeddings, axis=1) + 1e-12
         sims_all = (embeddings @ query_vec_np) / (emb_norms * (np.linalg.norm(query_vec_np) + 1e-12))
         topn = min(fanout, sims_all.shape[0])
         candidate_idx = np.argsort(-sims_all)[:topn]
-    else:
-        candidate_idx = np.asarray(candidate_idx, dtype=int)
+        sims = sims_all[candidate_idx].astype("float32")
 
+    if candidate_idx is None:
+        return pd.DataFrame()
+
+    candidate_idx = np.asarray(candidate_idx, dtype=int)
     candidate_idx = candidate_idx[(candidate_idx >= 0) & (candidate_idx < len(df))]
     if candidate_idx.size == 0:
         return pd.DataFrame()
 
     results = df.iloc[candidate_idx].copy()
-    cand_embeddings = embeddings[candidate_idx]
 
-    query_norm = np.linalg.norm(query_np[0]) + 1e-12
-    cand_norms = np.linalg.norm(cand_embeddings, axis=1) + 1e-12
-    sims = (cand_embeddings @ query_np[0]) / (cand_norms * query_norm)
+    if sims is None:
+        return pd.DataFrame()  # safety; shouldn't happen
 
+    # Popularity blending the same as before
     if use_popularity and "popularity" in results.columns:
         pop_vals = pd.to_numeric(results["popularity"], errors="coerce").fillna(0).to_numpy("float32")
         scores = (sims * np.log1p(pop_vals)).astype("float32")
@@ -414,6 +431,7 @@ def run_search(
 
     results = results.assign(score=scores, similarity=sims.astype("float32"))
 
+    # Safety filter
     if safe_mode and not results.empty:
         if "nsfw" in results.columns:
             results = results[~results["nsfw"].astype(bool)]
@@ -429,6 +447,7 @@ def run_search(
     if results.empty:
         return results
 
+    # Franchise filter
     if franchise_only and detected_franchise != "Unknown" and not results.empty:
         if "franchise" not in results.columns:
             results["franchise"] = "Unknown"
@@ -443,6 +462,7 @@ def run_search(
     if results.empty:
         return results
 
+    # Genre overlap filter/boost
     if use_genres and input_genres and not results.empty:
         def genre_overlap(val):
             if isinstance(val, list):
@@ -466,6 +486,7 @@ def run_search(
     if results.empty:
         return results
 
+    # Exclude the exact query title when anchor is used
     if use_name_anchor and "title" in results.columns:
         results = results[results["title"].str.lower() != query_lower]
 
@@ -499,8 +520,8 @@ st.title("🎬 Mario's Netflix")
 with st.expander("Technical info"):
     st.write(f"Model: `{MODEL_NAME}`")
     st.write(f"Parquet: `{PARQUET_FILE}`  (exists: {os.path.exists(PARQUET_FILE)})")
-    st.write(f"FAISS index: `{INDEX_FILE}`  (exists: {os.path.exists(INDEX_FILE)})  FAISS available: `{_HAVE_FAISS}`")
-    st.write(f"Embeddings: `{EMB_FILE}`  (exists: {os.path.exists(EMB_FILE)})")
+    st.write(f"FAISS index: `{INDEX_FILE}`  (exists: {os.path.exists(INDEX_FILE)})  FAISS available: `{_HAVE_FAISS}`  | FORCE_FAISS_ONLY={FORCE_FAISS_ONLY}")
+    st.write(f"Embeddings: `{EMB_FILE}`  (exists: {os.path.exists(EMB_FILE)})  (loaded only if no FAISS)")
     st.write(f"HF repo: `{HF_REPO_ID}`  type=`{HF_REPO_TYPE}`  rev=`{HF_REVISION}`")
 
 st.subheader("🔍 Search")
