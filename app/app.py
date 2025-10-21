@@ -1,6 +1,7 @@
-# app/ApplicationFix.py
+# app/Application.py
 # =========================================
 # Movie Recommender — Streamlit app (popularity toggle + safe fixes)
+# Hugging Face–aware loaders (parquet / faiss / npy)
 # =========================================
 
 # --- Streamlit must be configured first ---
@@ -9,7 +10,6 @@ st.set_page_config(page_title="Movie Recommender", layout="wide")
 
 # --- Std/3p imports ---
 import os
-import re
 import warnings
 from typing import Optional, List, Tuple
 
@@ -36,13 +36,22 @@ except Exception:
     _HAVE_FAISS = False
 
 from sentence_transformers import SentenceTransformer
+from huggingface_hub import hf_hub_download
 
 # ---------------- Config ----------------
 # Adjust these defaults if your files are elsewhere.
 MODEL_NAME   = os.getenv("MODEL_NAME", "SBERT_Movie_Recommender_v1")
-PARQUET_FILE = os.getenv("PARQUET_FILE", "data/movies.parquet")
-INDEX_FILE   = os.getenv("INDEX_FILE",   "movie_index.faiss")      # root
-EMB_FILE     = os.getenv("EMB_FILE",     "movie_embeddings.npy")   # root
+
+# You can keep local names (works locally) OR just the base filenames that exist on HF
+PARQUET_FILE = os.getenv("PARQUET_FILE", "movies.parquet")
+INDEX_FILE   = os.getenv("INDEX_FILE",   "movie_index.faiss")      # root or HF filename
+EMB_FILE     = os.getenv("EMB_FILE",     "movie_embeddings.npy")   # root or HF filename
+
+# Hugging Face dataset repo info (set these in Streamlit Cloud → Environment variables)
+HF_REPO_ID   = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset").strip()
+HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset").strip()
+HF_REVISION  = os.getenv("HF_REVISION", "main").strip()
+HF_TOKEN     = os.getenv("HF_TOKEN")  # optional; needed only if repo is private
 
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
 
@@ -50,6 +59,42 @@ TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
 def choose_pool(top_k: int, use_genres: bool) -> int:
     # notebook-like behavior: fanout = top_k * 20
     return max(top_k * 20, top_k)
+
+# ---------------- Path resolver (local / URL / HF) ----------------
+def _resolve_path(path_or_name: str, *, must_be_local: bool) -> Optional[str]:
+    """
+    Return a local path to use. Order:
+      1) If a local file exists at `path_or_name`, use it.
+      2) If it's http(s) and not must_be_local -> return the URL (for pandas parquet).
+      3) Attempt to download a file named basename(path_or_name) from the HF repo.
+    For FAISS and npy we set must_be_local=True (they need a local file).
+    """
+    if not path_or_name:
+        return None
+
+    # Already a local file?
+    if os.path.exists(path_or_name):
+        return path_or_name
+
+    # Remote URL allowed?
+    if path_or_name.startswith(("http://", "https://")):
+        return None if must_be_local else path_or_name
+
+    # Try Hugging Face by filename
+    filename = os.path.basename(path_or_name)
+    try:
+        local = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=filename,
+            repo_type=HF_REPO_TYPE,
+            revision=HF_REVISION,
+            local_dir="data",
+            local_dir_use_symlinks=False,
+            token=HF_TOKEN,  # harmless if None for public repos
+        )
+        return local
+    except Exception:
+        return None
 
 # ---------------- Caching layers ----------------
 @st.cache_resource(show_spinner=False)
@@ -59,8 +104,29 @@ def load_model() -> SentenceTransformer:
 
 @st.cache_data(show_spinner=False)
 def load_metadata(parquet_path: str) -> pd.DataFrame:
+    """
+    Loads parquet from:
+      - local path if present
+      - http(s) URL (pandas + pyarrow)
+      - Hugging Face (downloaded to ./data/)
+    """
+    # Resolve to local path or URL
+    resolved = _resolve_path(parquet_path, must_be_local=False)
+    try:
+        if resolved is None:
+            # As a last resort, if user passed a URL and we demanded local before:
+            if parquet_path.startswith(("http://", "https://")):
+                df = pd.read_parquet(parquet_path)  # pyarrow handles URLs
+            else:
+                raise FileNotFoundError(f"Could not resolve '{parquet_path}' locally or from HF")
+        else:
+            df = pd.read_parquet(resolved)
+    except Exception as e:
+        st.error(f"Failed to load parquet: {parquet_path}\nError: {e}")
+        return pd.DataFrame()
+
     # Reset index -> ensures row ↔ vector positions align
-    df = pd.read_parquet(parquet_path).reset_index(drop=True)
+    df = df.reset_index(drop=True)
 
     # Normalize columns we rely on
     if "title" in df.columns:
@@ -93,19 +159,31 @@ def load_metadata(parquet_path: str) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner=False)
 def load_faiss(index_path: str):
-    if not _HAVE_FAISS or not os.path.exists(index_path):
+    """
+    FAISS requires a local file. We resolve via:
+      local path -> HF download to ./data -> else None
+    """
+    if not _HAVE_FAISS:
+        return None
+    local = _resolve_path(index_path, must_be_local=True)
+    if not local or not os.path.exists(local):
         return None
     try:
-        return faiss.read_index(index_path)
+        return faiss.read_index(local)
     except Exception:
         return None
 
 @st.cache_resource(show_spinner=False)
 def load_embeddings(npy_path: str) -> Optional[np.ndarray]:
-    if not os.path.exists(npy_path):
+    """
+    Embeddings need a local .npy. We resolve via:
+      local path -> HF download to ./data -> else None
+    """
+    local = _resolve_path(npy_path, must_be_local=True)
+    if not local or not os.path.exists(local):
         return None
     try:
-        arr = np.load(npy_path, mmap_mode="r")
+        arr = np.load(local, mmap_mode="r")
         return arr.astype("float32") if arr.dtype != np.float32 else arr
     except Exception:
         return None
@@ -228,7 +306,6 @@ FRANCHISE_KEYWORDS = {
     ]
 }
 
-
 def detect_franchise(title: str, overview: str) -> str:
     text = f"{title} {overview}".lower()
     matches = {}
@@ -240,8 +317,6 @@ def detect_franchise(title: str, overview: str) -> str:
         return "Unknown"
     return max(matches, key=matches.get)
 
-
-
 def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     qn = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     En = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
@@ -250,7 +325,6 @@ def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int) -> Tuple[np.ndar
     return idx, sims[idx]
 
 # ---------------- Core search ----------------
-
 def run_search(
     parquet_name: str,
     index_name: str,
@@ -268,7 +342,7 @@ def run_search(
     embeddings = load_embeddings(emb_name or "")
 
     if embeddings is None:
-        st.error("Embeddings file is required for scoring.")
+        st.error("Embeddings file is required for scoring. Make sure EMB_FILE points to a valid .npy (local or on Hugging Face).")
         return pd.DataFrame()
 
     if len(df) != len(embeddings):
@@ -301,7 +375,7 @@ def run_search(
         use_name_anchor = False
 
     query_np = query_vec.detach().cpu().numpy().reshape(1, -1).astype("float32")
-    fanout = max(top_k * 20, top_k)
+    fanout = choose_pool(top_k, use_genres)
 
     candidate_idx = None
     if index_obj is not None:
@@ -419,7 +493,6 @@ def run_search(
     existing = [c for c in keep if c in top_results.columns]
     return top_results[existing].reset_index(drop=True)
 
-
 # ---------------- UI ----------------
 st.title("🎬 Mario's Netflix")
 
@@ -428,6 +501,7 @@ with st.expander("Technical info"):
     st.write(f"Parquet: `{PARQUET_FILE}`  (exists: {os.path.exists(PARQUET_FILE)})")
     st.write(f"FAISS index: `{INDEX_FILE}`  (exists: {os.path.exists(INDEX_FILE)})  FAISS available: `{_HAVE_FAISS}`")
     st.write(f"Embeddings: `{EMB_FILE}`  (exists: {os.path.exists(EMB_FILE)})")
+    st.write(f"HF repo: `{HF_REPO_ID}`  type=`{HF_REPO_TYPE}`  rev=`{HF_REVISION}`")
 
 st.subheader("🔍 Search")
 query = st.text_input("Title or description", placeholder="e.g., Interstellar — gritty space survival")
