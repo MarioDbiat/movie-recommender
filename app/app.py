@@ -1,9 +1,7 @@
 # app/app.py
 # =========================================
-# Movie Recommender — Streamlit app (FAISS-mmap fix)
-# - Hugging Face–aware loaders (parquet / faiss / npy)
-# - FAISS memory-mapped to avoid OOM on small machines
-# - Falls back to embeddings.npy if FAISS missing/unusable
+# Movie Recommender — Streamlit app
+# HF-aware loaders (parquet / faiss / npy), popularity toggle, safe-mode
 # =========================================
 
 # --- Streamlit must be configured first ---
@@ -18,26 +16,21 @@ from typing import Optional, List, Tuple
 import numpy as np
 import pandas as pd
 
-# Keep Cloud safe (no CUDA) and avoid noisy tokenizer threads
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
 # Silence only the specific FutureWarning from transformers -> torch.load
 warnings.filterwarnings(
     "ignore",
     message=r"You are using `torch.load` with `weights_only=False`",
     category=FutureWarning,
-    module="transformers",
+    module="transformers.modeling_utils",
 )
+
+# Avoid noisy tokenizer threads
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Optional FAISS (app still runs without it)
 try:
     import faiss  # type: ignore
     _HAVE_FAISS = True
-    try:
-        faiss.omp_set_num_threads(1)  # be nice to CPU on shared machines
-    except Exception:
-        pass
 except Exception:
     faiss = None
     _HAVE_FAISS = False
@@ -46,49 +39,49 @@ from sentence_transformers import SentenceTransformer
 from huggingface_hub import hf_hub_download
 
 # ---------------- Config ----------------
+# Adjust these if your assets live elsewhere.
+# Default model points to your HF repo (can be a local folder path as well).
 MODEL_NAME   = os.getenv("MODEL_NAME", "Mariodb/movie-recommender-model").strip()
 
-# Base filenames that exist locally or on HF
+# You can keep local names (works locally) OR the base filenames that exist on HF
 PARQUET_FILE = os.getenv("PARQUET_FILE", "movies.parquet").strip()
-INDEX_FILE   = os.getenv("INDEX_FILE",   "movie_index.faiss").strip()
-EMB_FILE     = os.getenv("EMB_FILE",     "movie_embeddings.npy").strip()
+INDEX_FILE   = os.getenv("INDEX_FILE",   "movie_index.faiss").strip()      # root or HF filename
+EMB_FILE     = os.getenv("EMB_FILE",     "movie_embeddings.npy").strip()   # root or HF filename
 
-# Hugging Face dataset repo info
+# Hugging Face dataset repo info (set these in Streamlit Cloud → App → Secrets)
 HF_REPO_ID   = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset").strip()
 HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset").strip()
 HF_REVISION  = os.getenv("HF_REVISION", "main").strip()
-HF_TOKEN     = os.getenv("HF_TOKEN")  # optional; only needed if repo is private
-
-# Allow falling back to embeddings when FAISS fails (recommended=True)
-FORCE_FAISS_ONLY = os.getenv("FORCE_FAISS_ONLY", "0").strip() == "1"
+HF_TOKEN     = os.getenv("HF_TOKEN")  # optional; only needed for private repos
 
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
 
-# Candidate pool sizing (kept generous for recall; adjust if needed)
+# Use the same candidate pool style as your notebook for parity
 def choose_pool(top_k: int, use_genres: bool) -> int:
+    # notebook-like behavior: fanout = top_k * 20
     return max(top_k * 20, top_k)
 
 # ---------------- Path resolver (local / URL / HF) ----------------
 def _resolve_path(path_or_name: str, *, must_be_local: bool) -> Optional[str]:
     """
-    Return a local path to use. Order:
+    Return a path to use. Order:
       1) If a local file exists at `path_or_name`, use it.
-      2) If it's http(s) and not must_be_local -> return the URL (for pandas parquet).
-      3) Attempt to download a file named basename(path_or_name) from the HF repo.
-    For FAISS and npy we set must_be_local=True (they need a local file).
+      2) If it's http(s) and not must_be_local -> return the URL (pandas parquet can stream).
+      3) Attempt to download basename(path_or_name) from HF repo to ./data.
+    For FAISS and NPY we set must_be_local=True (they need a local file).
     """
     if not path_or_name:
         return None
 
-    # Already a local file?
+    # Already present locally?
     if os.path.exists(path_or_name):
         return path_or_name
 
-    # Remote URL allowed?
+    # Remote URL acceptable?
     if path_or_name.startswith(("http://", "https://")):
         return None if must_be_local else path_or_name
 
-    # Try Hugging Face by filename
+    # Try Hugging Face by filename (download to ./data)
     filename = os.path.basename(path_or_name)
     try:
         local = hf_hub_download(
@@ -107,7 +100,18 @@ def _resolve_path(path_or_name: str, *, must_be_local: bool) -> Optional[str]:
 # ---------------- Caching layers ----------------
 @st.cache_resource(show_spinner=False)
 def load_model() -> SentenceTransformer:
-    return SentenceTransformer(MODEL_NAME)
+    """
+    Loads your local fine-tuned SBERT folder or HF model id.
+    If your repo is private, ensure HF_TOKEN (or HUGGINGFACE_HUB_TOKEN) is set.
+    """
+    try:
+        return SentenceTransformer(MODEL_NAME)
+    except Exception as e:
+        st.error(
+            "Failed to load SentenceTransformer model. "
+            f"MODEL_NAME='{MODEL_NAME}'. Error: {e}"
+        )
+        raise
 
 @st.cache_data(show_spinner=False)
 def load_metadata(parquet_path: str) -> pd.DataFrame:
@@ -120,6 +124,7 @@ def load_metadata(parquet_path: str) -> pd.DataFrame:
     resolved = _resolve_path(parquet_path, must_be_local=False)
     try:
         if resolved is None:
+            # If nothing resolved but user gave a URL and we demanded local earlier
             if parquet_path.startswith(("http://", "https://")):
                 df = pd.read_parquet(parquet_path)  # pyarrow handles URLs
             else:
@@ -167,7 +172,6 @@ def load_faiss(index_path: str):
     """
     FAISS requires a local file. We resolve via:
       local path -> HF download to ./data -> else None
-    Memory-map the index to avoid loading ~1.23 GB fully into RAM.
     """
     if not _HAVE_FAISS:
         return None
@@ -175,14 +179,7 @@ def load_faiss(index_path: str):
     if not local or not os.path.exists(local):
         return None
     try:
-        idx = faiss.read_index(local, faiss.IO_FLAG_MMAP)  # <-- critical fix
-        # Optional tuning if index is IVF: modest nprobe
-        try:
-            if hasattr(idx, "nprobe"):
-                idx.nprobe = int(os.getenv("FAISS_NPROBE", "16"))
-        except Exception:
-            pass
-        return idx
+        return faiss.read_index(local)
     except Exception:
         return None
 
@@ -196,7 +193,7 @@ def load_embeddings(npy_path: str) -> Optional[np.ndarray]:
     if not local or not os.path.exists(local):
         return None
     try:
-        arr = np.load(local, mmap_mode="r")
+        arr = np.load(local, mmap_mode="r")  # read-only memmap to reduce memory
         return arr.astype("float32") if arr.dtype != np.float32 else arr
     except Exception:
         return None
@@ -235,9 +232,9 @@ def _find_query_movie_franchise(df: pd.DataFrame, query_text: str) -> str:
     # fallback: look in popular titles containing the query
     sample = df.nlargest(50000, "popularity") if "popularity" in df.columns and len(df) > 50000 else df
     titles = sample["title"].astype(str).tolist()
-    for i, t in enumerate(titles):
-        if q in t.lower():
-            return str(sample.iloc[i].get("franchise", "")).strip()
+    idxs = [i for i, t in enumerate(titles) if q in t.lower()]
+    if idxs and "franchise" in sample.columns:
+        return str(sample.iloc[idxs[0]]["franchise"]).strip()
     return ""
 
 FRANCHISE_KEYWORDS = {
@@ -316,17 +313,19 @@ FRANCHISE_KEYWORDS = {
     "Jurassic Park": [
         "jurassic park", "jurassic world", "raptor", "velociraptor", "t-rex",
         "indominus", "ian malcolm", "claire dearing"
-    ],
+    ]
 }
 
 def detect_franchise(title: str, overview: str) -> str:
     text = f"{title} {overview}".lower()
-    scores = {}
-    for name, kws in FRANCHISE_KEYWORDS.items():
-        hits = sum(1 for kw in kws if kw in text)
+    matches = {}
+    for franchise, keywords in FRANCHISE_KEYWORDS.items():
+        hits = sum(1 for kw in keywords if kw in text)
         if hits:
-            scores[name] = hits
-    return max(scores, key=scores.get) if scores else "Unknown"
+            matches[franchise] = hits
+    if not matches:
+        return "Unknown"
+    return max(matches, key=matches.get)
 
 def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     qn = query_vec / (np.linalg.norm(query_vec) + 1e-12)
@@ -348,22 +347,15 @@ def run_search(
     top_k: int,
 ) -> pd.DataFrame:
     df = load_metadata(parquet_name)
-    if df.empty:
-        return pd.DataFrame()
-
     model = load_model()
     index_obj = load_faiss(index_name)
+    embeddings = load_embeddings(emb_name or "")
 
-    # Prefer FAISS. Load embeddings only if FAISS is missing/unavailable (unless forced off).
-    embeddings = None
-    if (index_obj is None) and (not FORCE_FAISS_ONLY):
-        embeddings = load_embeddings(emb_name or "")
-
-    if index_obj is None and embeddings is None:
-        st.error("Need either a FAISS index or an embeddings .npy to score.")
+    if embeddings is None:
+        st.error("Embeddings file is required for scoring. Make sure EMB_FILE points to a valid .npy (local or on Hugging Face).")
         return pd.DataFrame()
 
-    if embeddings is not None and len(df) != len(embeddings):
+    if len(df) != len(embeddings):
         st.error("Embeddings and metadata shapes do not align.")
         return pd.DataFrame()
 
@@ -374,7 +366,6 @@ def run_search(
     query_lower = query_clean.lower()
     movie_row = df[df["title"].str.lower() == query_lower] if "title" in df.columns else pd.DataFrame()
 
-    # Prefer encoding the movie OVERVIEW if the user typed an exact title (richer signal)
     if not movie_row.empty:
         row = movie_row.iloc[0]
         overview = str(row.get("overview", "") or "")
@@ -382,7 +373,7 @@ def run_search(
         detected_franchise = detect_franchise(str(row.get("title", "")), overview)
         genres_val = row.get("genres", [])
         if isinstance(genres_val, list):
-            input_genres = {g for g in genres_val if g and g.lower() != "unknown"}
+            input_genres = {g for g in genres_val if g != "Unknown"}
         else:
             input_genres = set(_split_genres(str(genres_val)))
         use_name_anchor = True
@@ -393,76 +384,79 @@ def run_search(
         input_genres = set()
         use_name_anchor = False
 
-    query_np = query_vec.detach().cpu().numpy().reshape(-1).astype("float32")
+    query_np = query_vec.detach().cpu().numpy().reshape(1, -1).astype("float32")
     fanout = choose_pool(top_k, use_genres)
 
     candidate_idx = None
-    sims = None
-
-    # ---- Retrieve with FAISS (memory-mapped) ----
     if index_obj is not None:
         try:
-            # Normalize query for cosine/IP style
-            qn = query_np / (np.linalg.norm(query_np) + 1e-12)
-            D, I = index_obj.search(qn[None, :], fanout)
-            candidate_idx = I[0]
-            sims = D[0].astype("float32")
+            _, idxs = index_obj.search(query_np, fanout)
+            candidate_idx = idxs[0]
         except Exception as exc:
-            st.warning(f"FAISS search failed ({exc}); falling back to cosine.")
+            st.warning(f"FAISS search failed ({exc}); falling back to cosine search.")
             candidate_idx = None
-            sims = None
 
-    # ---- Fallback: cosine over embeddings.npy (mmap) ----
-    if (candidate_idx is None or len(candidate_idx) == 0) and embeddings is not None:
-        qn = query_np / (np.linalg.norm(query_np) + 1e-12)
-        En = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
-        sims_all = En @ qn
+    if candidate_idx is None or len(candidate_idx) == 0:
+        query_vec_np = query_np[0]
+        emb_norms = np.linalg.norm(embeddings, axis=1) + 1e-12
+        sims_all = (embeddings @ query_vec_np) / (emb_norms * (np.linalg.norm(query_vec_np) + 1e-12))
         topn = min(fanout, sims_all.shape[0])
         candidate_idx = np.argsort(-sims_all)[:topn]
-        sims = sims_all[candidate_idx].astype("float32")
+    else:
+        candidate_idx = np.asarray(candidate_idx, dtype=int)
 
-    if candidate_idx is None:
-        return pd.DataFrame()
-
-    candidate_idx = np.asarray(candidate_idx, dtype=int)
     candidate_idx = candidate_idx[(candidate_idx >= 0) & (candidate_idx < len(df))]
-    if candidate_idx.size == 0 or sims is None:
+    if candidate_idx.size == 0:
         return pd.DataFrame()
 
     results = df.iloc[candidate_idx].copy()
+    cand_embeddings = embeddings[candidate_idx]
 
-    # Safety filter
+    query_norm = np.linalg.norm(query_np[0]) + 1e-12
+    cand_norms = np.linalg.norm(cand_embeddings, axis=1) + 1e-12
+    sims = (cand_embeddings @ query_np[0]) / (cand_norms * query_norm)
+
+    if use_popularity and "popularity" in results.columns:
+        pop_vals = pd.to_numeric(results["popularity"], errors="coerce").fillna(0).to_numpy("float32")
+        scores = (sims * np.log1p(pop_vals)).astype("float32")
+    else:
+        scores = sims.astype("float32")
+
+    results = results.assign(score=scores, similarity=sims.astype("float32"))
+
     if safe_mode and not results.empty:
-        bad_terms = ["nsfw", "adult", "porn", "xxx", "sex", "erotic", "babe"]
-        pattern = "(?i)" + "|".join(bad_terms)
-        mask = pd.Series(False, index=results.index)
-        for col in ["genres", "title", "overview"]:
-            if col in results.columns:
-                mask |= results[col].astype(str).str.contains(pattern, na=False, regex=True)
-        results = results.loc[~mask]
-
-    if results.empty:
-        return results
-
-    # Franchise hard filter (only when toggle is ON)
-    if franchise_only:
-        q_fr = _find_query_movie_franchise(df, query_clean)
-        if q_fr and q_fr.lower() != "unknown":
-            if "franchise" not in results.columns:
-                results["franchise"] = "Unknown"
-            results = results[results["franchise"].astype(str).str.strip().str.lower() == q_fr.lower()]
+        if "nsfw" in results.columns:
+            results = results[~results["nsfw"].astype(bool)]
         else:
-            # If franchise not known, keep results as-is
-            pass
+            bad_terms = ["nsfw", "adult", "porn", "xxx", "sex", "erotic", "babe"]
+            pattern = "(?i)" + "|".join(bad_terms)
+            mask = pd.Series(False, index=results.index)
+            for col in ["genres", "title", "overview"]:
+                if col in results.columns:
+                    mask |= results[col].astype(str).str.contains(pattern, na=False, regex=True)
+            results = results.loc[~mask]
 
     if results.empty:
         return results
 
-    # Genre overlap filter + soft boost
-    if use_genres and input_genres:
+    if franchise_only and detected_franchise != "Unknown" and not results.empty:
+        if "franchise" not in results.columns:
+            results["franchise"] = "Unknown"
+        missing_mask = results["franchise"].fillna("Unknown").isin(["", "Unknown"])
+        if missing_mask.any():
+            results.loc[missing_mask, "franchise"] = results.loc[missing_mask].apply(
+                lambda row: detect_franchise(str(row.get("title", "")), str(row.get("overview", ""))),
+                axis=1,
+            )
+        results = results[results["franchise"] == detected_franchise]
+
+    if results.empty:
+        return results
+
+    if use_genres and input_genres and not results.empty:
         def genre_overlap(val):
             if isinstance(val, list):
-                working = {g for g in val if g and g.lower() != "unknown"}
+                working = {g for g in val if g != "Unknown"}
             else:
                 working = set(_split_genres(str(val)))
             return len(input_genres & working)
@@ -471,64 +465,53 @@ def run_search(
         min_required = 2 if len(input_genres) >= 2 else 1
         filtered = results[results["genre_overlap"] >= min_required]
 
-        # If too strict, relax to at least 1 overlap
         if len(filtered) < top_k and results["genre_overlap"].max() >= 1:
-            filtered = results[results["genre_overlap"] >= 1]
+            fallback_threshold = 1 if min_required > 1 else 0
+            filtered = results[results["genre_overlap"] >= fallback_threshold]
 
         results = filtered
-        if results.empty:
-            return results
+        if not results.empty:
+            results = results.assign(score=results["score"] * (1.0 + 0.05 * results["genre_overlap"]))
 
-    # Exclude the exact query title when anchoring on title
+    if results.empty:
+        return results
+
     if use_name_anchor and "title" in results.columns:
         results = results[results["title"].str.lower() != query_lower]
-        if results.empty:
-            return results
 
-    # Build a score
-    sims = sims[: len(results)].astype("float32")  # align length
-    if use_popularity and "popularity" in results.columns:
-        pop_vals = pd.to_numeric(results["popularity"], errors="coerce").fillna(0).to_numpy("float32")
-        score = (sims * np.log1p(pop_vals)).astype("float32")
-    else:
-        score = sims
-
-    # Soft bonus for genre overlap (if computed)
-    if "genre_overlap" in results.columns:
-        score = score * (1.0 + 0.05 * results["genre_overlap"].to_numpy("float32"))
-
-    results = results.assign(score=score, similarity=sims)
-
-    # Build poster_url for UI cards
-    if "poster_path" in results.columns:
-        results["poster_url"] = results["poster_path"].astype(str).str.strip()
-        mask = results["poster_url"].str.len() > 0
-        results.loc[mask, "poster_url"] = TMDB_IMG_BASE + results.loc[mask, "poster_url"]
-    elif "poster_url" not in results.columns:
-        results["poster_url"] = ""
-
-    keep = ["title", "genres", "franchise", "popularity", "poster_url", "overview", "score", "similarity"]
-    if "id" in results.columns:
-        keep.append("id")
-    existing = [c for c in keep if c in results.columns]
+    if results.empty:
+        return results
 
     results = results.sort_values(by="score", ascending=False)
-    return results[existing].head(top_k).reset_index(drop=True)
+    top_results = results.head(top_k).copy()
+
+    if "franchise" not in top_results.columns:
+        top_results["franchise"] = "Unknown"
+    else:
+        top_results["franchise"] = top_results["franchise"].fillna("Unknown").replace("", "Unknown")
+
+    if "poster_path" in top_results.columns:
+        top_results["poster_url"] = top_results["poster_path"].astype(str).str.strip()
+        mask = top_results["poster_url"].str.len() > 0
+        top_results.loc[mask, "poster_url"] = TMDB_IMG_BASE + top_results.loc[mask, "poster_url"]
+    elif "poster_url" not in top_results.columns:
+        top_results["poster_url"] = ""
+
+    keep = ["title", "genres", "franchise", "popularity", "poster_url", "overview", "score", "similarity"]
+    if "id" in top_results.columns:
+        keep.append("id")
+    existing = [c for c in keep if c in top_results.columns]
+    return top_results[existing].reset_index(drop=True)
 
 # ---------------- UI ----------------
 st.title("🎬 Mario's Netflix")
 
 with st.expander("Technical info"):
     st.write(f"Model: `{MODEL_NAME}`")
-    st.write(f"Parquet: `{PARQUET_FILE}`  (exists: {os.path.exists(PARQUET_FILE)})")
-    st.write(f"FAISS index: `{INDEX_FILE}`  (exists: {os.path.exists(INDEX_FILE)})  FAISS available: `{_HAVE_FAISS}`  | FORCE_FAISS_ONLY={FORCE_FAISS_ONLY}")
-    st.write(f"Embeddings: `{EMB_FILE}`  (exists: {os.path.exists(EMB_FILE)})  (loaded only if no FAISS)")
+    st.write(f"Parquet: `{PARQUET_FILE}`")
+    st.write(f"FAISS index: `{INDEX_FILE}`  (FAISS available: `{_HAVE_FAISS}`)")
+    st.write(f"Embeddings: `{EMB_FILE}`")
     st.write(f"HF repo: `{HF_REPO_ID}`  type=`{HF_REPO_TYPE}`  rev=`{HF_REVISION}`")
-
-st.caption(
-    "Type a title or describe what you want to watch. "
-    "Tip: the Genre filter works best when you enter an exact movie title."
-)
 
 st.subheader("🔍 Search")
 query = st.text_input("Title or description", placeholder="e.g., Interstellar — gritty space survival")
@@ -547,7 +530,7 @@ with col2:
     use_genres = st.checkbox(
         "Use genres of query movie",
         value=False,
-        help="HARD-ish filter: prefer results sharing ≥2 genres with the query (works best with exact title)."
+        help="HARD filter: keep only results sharing at least 2 genres with the query (exact title works best)."
     )
 with col3:
     safe_mode = st.checkbox(
@@ -592,16 +575,15 @@ if st.button("Recommend", type="primary"):
         else:
             for _, row in out.iterrows():
                 poster_url = row.get("poster_url") or "https://via.placeholder.com/120x180?text=No+Image"
-                c1, c2 = st.columns([1, 5], vertical_alignment="center")
+                c1, c2 = st.columns([1, 5])
                 with c1:
                     st.image(poster_url, width=110)
                 with c2:
                     st.markdown(f"### {row.get('title','Untitled')}")
                     if row.get("genres"):
-                        if isinstance(row["genres"], list):
-                            st.caption(f"Genres: {', '.join(row['genres'])}")
-                        else:
-                            st.caption(f"Genres: {row['genres']}")
+                        st.caption(
+                            f"Genres: {', '.join(row['genres']) if isinstance(row['genres'], list) else row['genres']}"
+                        )
                     if row.get("franchise"):
                         st.caption(f"🎬 Franchise: {row['franchise']}")
                     if row.get("popularity") is not None:
@@ -615,6 +597,3 @@ if st.button("Recommend", type="primary"):
 
             with st.expander("See raw table"):
                 st.dataframe(out)
-
-# Footer
-st.markdown("<br><hr><center>Made with ❤️ by Mario</center>", unsafe_allow_html=True)
