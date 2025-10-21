@@ -1,19 +1,19 @@
 # --- Core ---
 streamlit==1.40.1
+rich==13.9.4
 sentence-transformers==2.2.2
 transformers==4.30.0
 scikit-learn==1.3.2
 pandas==2.0.3
-numpy==1.24.3
+numpy==1.26.4
 tqdm==4.67.1
 requests==2.32.3
 pillow==10.4.0
 huggingface_hub==0.20.3
 pyarrow==17.0.0
 
-# --- FAISS (pin to avoid format drift) ---
+# --- FAISS ---
 faiss-cpu==1.8.0.post1
 
-# --- Force CPU PyTorch on Cloud (no CUDA wheels) ---
-torch==2.2.2+cpu ; sys_platform != "darwin"
---extra-index-url https://download.pytorch.org/whl/cpu
+# --- PyTorch CPU ---
+torch==2.2.2
