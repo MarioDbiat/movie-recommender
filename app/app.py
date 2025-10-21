@@ -40,7 +40,7 @@ from huggingface_hub import hf_hub_download
 
 # ---------------- Config ----------------
 # Adjust these defaults if your files are elsewhere.
-MODEL_NAME   = os.getenv("MODEL_NAME", "SBERT_Movie_Recommender_v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "Mariodb/movie-recommender-model")
 
 # You can keep local names (works locally) OR just the base filenames that exist on HF
 PARQUET_FILE = os.getenv("PARQUET_FILE", "movies.parquet")
