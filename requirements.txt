@@ -1,10 +1,9 @@
-# --- PyTorch CPU wheels FIRST ---
+--index-url https://pypi.org/simple
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.2+cpu
 
-# --- Core ---
+torch==2.2.2+cpu
 streamlit==1.40.1
-rich==13.9.4            # pin <14 so Streamlit stays happy
+rich==13.9.4
 sentence-transformers==2.2.2
 transformers==4.30.0
 scikit-learn==1.3.2
@@ -15,9 +14,5 @@ requests==2.32.3
 pillow==10.4.0
 huggingface_hub==0.20.3
 pyarrow==17.0.0
-
-# --- FAISS (pin to avoid format drift) ---
 faiss-cpu==1.8.0.post1
-
-# (optional but recommended)
 protobuf==5.29.5
