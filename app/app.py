@@ -60,16 +60,6 @@ EMB_OVERRIDE     = os.getenv("EMB_FILE", "").strip()
 if EMB_OVERRIDE:
     LOAD_EMB = True
 
-EMB_USE_MMAP_SETTING = os.getenv("EMB_USE_MMAP", "").strip().lower()
-if EMB_USE_MMAP_SETTING in {"0", "false", "no", "off"}:
-    EMB_USE_MMAP = False
-elif EMB_USE_MMAP_SETTING in {"1", "true", "yes", "on"}:
-    EMB_USE_MMAP = True
-else:
-    EMB_USE_MMAP = None
-
-EMB_INMEMORY_MAX_MB = int(os.getenv("EMB_INMEMORY_MAX_MB", "1536"))
-
 DEFAULT_LOCAL_EMB = (
     os.path.join(os.getcwd(), FULL_EMB) if FULL_EMB and not os.path.isabs(FULL_EMB) else FULL_EMB
 )
@@ -369,20 +359,7 @@ def load_embeddings(emb_name: Optional[str]) -> Optional[np.ndarray]:
             path = _hf_path(emb_name)
             if not os.path.exists(path):
                 return None
-
-        use_mmap = EMB_USE_MMAP
-        try:
-            size_bytes = os.path.getsize(path)
-        except OSError:
-            size_bytes = 0
-        if use_mmap is None:
-            threshold = max(EMB_INMEMORY_MAX_MB, 256) * 1024 * 1024
-            use_mmap = size_bytes > threshold if size_bytes else True
-
-        if use_mmap:
-            arr = np.load(path, mmap_mode="r")
-            return arr.astype("float32") if arr.dtype != np.float32 else arr
-        arr = np.load(path)
+        arr = np.load(path, mmap_mode="r")
         return arr.astype("float32") if arr.dtype != np.float32 else arr
     except Exception as e:
         st.warning(f"Embeddings fallback not available: {e}")
