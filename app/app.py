@@ -402,7 +402,8 @@ def run_search(
         embeddings = load_embeddings(FULL_EMB)
 
     if embeddings is not None:
-        embeddings = np.asarray(embeddings, dtype="float32")
+        if getattr(embeddings, "dtype", None) != np.float32:
+            embeddings = np.asarray(embeddings, dtype="float32")
         if embeddings.shape[0] != len(meta):
             st.warning("Embeddings and metadata shapes do not align; ignoring embeddings for now.")
             embeddings = None
