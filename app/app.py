@@ -30,12 +30,20 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 # ---------------- Mode / config (env-overridable) ----------------
 # MODE = auto | lite | full
 MODE = os.getenv("MODE", "auto").lower().strip()
-LOAD_EMB = os.getenv("LOAD_EMB", "0") == "1"  # embeddings fallback (off by default)
+_load_emb_raw = os.getenv("LOAD_EMB", "0")
+LOAD_EMB = str(_load_emb_raw).strip().lower() in {"1", "true", "yes", "on"}
 
 # Hugging Face dataset repo
 HF_REPO_ID   = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset").strip()
 HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset").strip()
 HF_REVISION  = os.getenv("HF_REVISION", "main").strip()
+hf_token_env = os.getenv("HF_TOKEN")
+if hf_token_env:
+    hf_token_env = hf_token_env.strip()
+if not hf_token_env:
+    alt = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    hf_token_env = alt.strip() if isinstance(alt, str) else ""
+HF_TOKEN = hf_token_env or None
 
 # Filenames in your HF repo (you showed these names)
 LITE_PARQUET = os.getenv("LITE_PARQUET", "movies.parquet").strip()
@@ -44,6 +52,19 @@ LITE_INDEX   = os.getenv("LITE_INDEX",   "movie_index.faiss").strip()
 FULL_PARQUET = os.getenv("FULL_PARQUET", "movies.parquet").strip()
 FULL_INDEX   = os.getenv("FULL_INDEX",   "movie_index.faiss").strip()
 FULL_EMB     = os.getenv("FULL_EMB",     "movie_embeddings.npy").strip()
+
+# Explicit overrides (e.g. Streamlit secrets)
+PARQUET_OVERRIDE = os.getenv("PARQUET_FILE", "").strip()
+INDEX_OVERRIDE   = os.getenv("INDEX_FILE", "").strip()
+EMB_OVERRIDE     = os.getenv("EMB_FILE", "").strip()
+if EMB_OVERRIDE:
+    LOAD_EMB = True
+
+DEFAULT_LOCAL_EMB = (
+    os.path.join(os.getcwd(), FULL_EMB) if FULL_EMB and not os.path.isabs(FULL_EMB) else FULL_EMB
+)
+if not LOAD_EMB and DEFAULT_LOCAL_EMB and os.path.exists(DEFAULT_LOCAL_EMB):
+    LOAD_EMB = True
 
 # Local fallbacks (used only if HF fetch fails AND files exist locally)
 DATA_CSV   = os.getenv("DATA_CSV",   "data/movies.csv")
@@ -210,7 +231,7 @@ def _hf_path(filename: str) -> str:
         revision=HF_REVISION,
         local_dir="data",
         local_dir_use_symlinks=False,
-        # token=os.getenv("HF_TOKEN")  # uncomment if your repo is private
+        token=HF_TOKEN,
     )
 
 def _choose_files() -> Tuple[str, str, Optional[str]]:
@@ -218,12 +239,13 @@ def _choose_files() -> Tuple[str, str, Optional[str]]:
     Decide which artifacts to use (lite vs full) WITHOUT pre-downloading.
     We try lite first during load; on 404 we fall back to full automatically.
     """
-    if MODE == "lite":
-        return (LITE_PARQUET, LITE_INDEX, None)
-    if MODE == "full":
-        return (FULL_PARQUET, FULL_INDEX, FULL_EMB if LOAD_EMB else None)
-    # auto
-    return (LITE_PARQUET, LITE_INDEX, None)
+    wants_full = MODE == "full" or (MODE == "auto" and (LOAD_EMB or bool(EMB_OVERRIDE)))
+    default_parquet = FULL_PARQUET if wants_full else LITE_PARQUET
+    default_index = FULL_INDEX if wants_full else LITE_INDEX
+    parquet = PARQUET_OVERRIDE or default_parquet
+    index = INDEX_OVERRIDE or default_index
+    emb = EMB_OVERRIDE or (FULL_EMB if (LOAD_EMB or bool(EMB_OVERRIDE)) else "")
+    return (parquet, index, emb if emb else None)
 
 # ---------------- Cached loaders ----------------
 @st.cache_resource
@@ -317,10 +339,28 @@ def load_embeddings(emb_name: Optional[str]) -> Optional[np.ndarray]:
     if not emb_name:
         return None
     try:
-        path = EMB_PATH if os.path.exists(EMB_PATH) else _hf_path(emb_name)
-        if not os.path.exists(path):
-            return None
-        return np.load(path, mmap_mode="r")
+        candidates = []
+        if EMB_PATH and os.path.exists(EMB_PATH):
+            candidates.append(EMB_PATH)
+
+        if os.path.isabs(emb_name):
+            candidates.append(emb_name)
+        else:
+            # Check common relative locations before downloading from HF
+            candidates.extend([
+                os.path.join(os.getcwd(), emb_name),
+                os.path.join("app", emb_name),
+                os.path.join("data", emb_name),
+                emb_name,
+            ])
+
+        path = next((p for p in candidates if p and os.path.exists(p)), None)
+        if path is None:
+            path = _hf_path(emb_name)
+            if not os.path.exists(path):
+                return None
+        arr = np.load(path, mmap_mode="r")
+        return arr.astype("float32") if arr.dtype != np.float32 else arr
     except Exception as e:
         st.warning(f"Embeddings fallback not available: {e}")
         return None
@@ -346,13 +386,14 @@ def run_search(
     use_popularity: bool,
     top_k: int,
 ) -> pd.DataFrame:
-    """Return a top-k DataFrame with upgraded scoring and safety filters."""
+    """Replicate the proven ApplicationFix pipeline with optional popularity blending."""
     meta = load_metadata(parquet_name)
     if meta.empty:
         return pd.DataFrame()
 
     meta = _ensure_franchise(meta.copy())
     model = load_model()
+    index_obj = load_faiss(index_name)
 
     embeddings = None
     if emb_name:
@@ -360,9 +401,13 @@ def run_search(
     elif LOAD_EMB and FULL_EMB:
         embeddings = load_embeddings(FULL_EMB)
 
-    if embeddings is not None and len(embeddings) != len(meta):
-        st.warning("Embeddings and metadata have different lengths; ignoring embeddings for now.")
-        embeddings = None
+    if embeddings is not None:
+        embeddings = np.asarray(embeddings, dtype="float32")
+        if embeddings.shape[0] != len(meta):
+            st.warning("Embeddings and metadata shapes do not align; ignoring embeddings for now.")
+            embeddings = None
+    elif emb_name:
+        st.info("Embeddings file not found; using encoder fallback. Recommendations may be weaker.")
 
     query_clean = query_text.strip()
     if not query_clean:
@@ -377,99 +422,101 @@ def run_search(
 
     if not exact.empty:
         row = exact.iloc[0]
-        overview = str(row.get("overview", "") or query_clean)
-        q_vec = model.encode([overview], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
-        detected_franchise = (
-            str(row.get("franchise", "")).strip()
-            or detect_franchise(row.get("title", ""), overview)
-            or "Unknown"
-        )
+        overview = str(row.get("overview", "") or "")
+        query_vec = model.encode([overview], convert_to_numpy=True)[0].astype("float32")
+        detected_franchise = detect_franchise(str(row.get("title", "")), overview) or "Unknown"
         genres_val = row.get("genres", [])
         if isinstance(genres_val, list):
             input_genres = {
                 str(g).strip() for g in genres_val if str(g).strip() and str(g).lower() != "unknown"
             }
         else:
-            input_genres = {
-                g for g in _split_genres(str(genres_val)) if g and g.lower() != "unknown"
-            }
+            input_genres = {g for g in _split_genres(str(genres_val)) if g and g.lower() != "unknown"}
         use_name_anchor = True
     else:
-        q_vec = model.encode([query_clean], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
-        detected_franchise = detect_franchise("", query_clean) or "Unknown"
+        overview = query_clean
+        query_vec = model.encode([overview], convert_to_numpy=True)[0].astype("float32")
+        detected_franchise = detect_franchise("", overview) or "Unknown"
 
     if use_genres and not input_genres:
         fallback_genres = _find_query_movie_genres(meta, query_text)
-        input_genres = {
-            g for g in fallback_genres if g and g.lower() != "unknown"
-        }
+        input_genres = {g for g in fallback_genres if g and g.lower() != "unknown"}
 
-    base_pool = POOL_WIDE if use_genres else POOL_BASE
-    pool = int(min(POOL_MAX, max(base_pool, top_k * 10)))
+    query_np = query_vec.reshape(1, -1).astype("float32")
+    fanout = max(top_k * 20, top_k)
 
-    faiss_indices = None
-    faiss_index = load_faiss(index_name)
-    if faiss_index is not None:
+    candidate_idx = None
+    if index_obj is not None:
         try:
-            _, faiss_results = faiss_index.search(q_vec[None, :], pool)
-            faiss_indices = faiss_results[0]
-            if faiss_indices is not None:
-                faiss_indices = faiss_indices[faiss_indices >= 0]
+            _, idxs = index_obj.search(query_np, fanout)
+            candidate_idx = idxs[0]
         except Exception as exc:
-            st.warning(f"FAISS search failed; falling back to embeddings. Error: {exc}")
-            faiss_indices = None
+            st.warning(f"FAISS search failed ({exc}); falling back to embedding search.")
+            candidate_idx = None
 
-    if (faiss_indices is None or len(faiss_indices) == 0) and embeddings is not None:
-        faiss_indices, _ = cosine_topk(q_vec, embeddings, pool)
+    if (candidate_idx is None or len(candidate_idx) == 0) and embeddings is not None:
+        q_norm = np.linalg.norm(query_vec) + 1e-12
+        emb_norms = np.linalg.norm(embeddings, axis=1) + 1e-12
+        sims_all = (embeddings @ query_vec) / (emb_norms * q_norm)
+        topn = min(fanout, sims_all.shape[0])
+        candidate_idx = np.argsort(-sims_all)[:topn]
 
-    if faiss_indices is None or len(faiss_indices) == 0:
-        st.error(
-            "Search index unavailable (no FAISS results and embeddings not provided). "
-            "Upload FAISS to Hugging Face or include embeddings locally."
+    if candidate_idx is None or len(candidate_idx) == 0:
+        pool_n = min(len(meta), max(fanout, POOL_WIDE))
+        if "popularity" in meta.columns:
+            pool_df = meta.nlargest(pool_n, "popularity").copy()
+        else:
+            pool_df = meta.head(pool_n).copy()
+
+        texts = (
+            pool_df["overview"].fillna("").astype(str).tolist()
+            if "overview" in pool_df.columns
+            else pool_df["title"].astype(str).tolist()
         )
+        cand_vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+        cand_norm = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
+        sims_local = cand_norm @ q_norm
+        part = np.argpartition(-sims_local, min(len(sims_local) - 1, fanout - 1))[:fanout]
+        order = np.argsort(-sims_local[part])
+        candidate_idx = pool_df.index.to_numpy()[part[order]]
+
+    candidate_idx = np.asarray(candidate_idx, dtype=int)
+    candidate_idx = candidate_idx[(candidate_idx >= 0) & (candidate_idx < len(meta))]
+    if candidate_idx.size == 0:
         return pd.DataFrame()
 
-    faiss_indices = np.asarray(faiss_indices, dtype=int)
-    faiss_indices = faiss_indices[(faiss_indices >= 0) & (faiss_indices < len(meta))]
-    if faiss_indices.size == 0:
-        return pd.DataFrame()
+    results = meta.iloc[candidate_idx].copy()
 
-    results = meta.iloc[faiss_indices].copy()
-
-    sims: Optional[np.ndarray] = None
     if embeddings is not None:
-        try:
-            cand_vecs = embeddings[faiss_indices].astype("float32")
-            norms = np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12
-            normalized = cand_vecs / norms
-            sims = (normalized @ q_vec).astype("float32")
-        except Exception:
-            sims = None
+        cand_embeddings = embeddings[candidate_idx]
+        query_norm = np.linalg.norm(query_vec) + 1e-12
+        cand_norms = np.linalg.norm(cand_embeddings, axis=1) + 1e-12
+        sims = (cand_embeddings @ query_vec) / (cand_norms * query_norm)
+    else:
+        texts = (
+            results["overview"].fillna("").astype(str).tolist()
+            if "overview" in results.columns
+            else results["title"].astype(str).tolist()
+        )
+        cand_vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+        cand_norm = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
+        sims = cand_norm @ q_norm
 
-    if sims is None:
-        try:
-            texts = (
-                results["overview"].fillna("").astype(str).tolist()
-                if "overview" in results.columns
-                else results["title"].astype(str).tolist()
-            )
-            cand_vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-            sims = (cand_vecs @ q_vec).astype("float32")
-        except Exception:
-            sims = np.zeros(len(results), dtype="float32")
-
-    sims = np.squeeze(sims).astype("float32")
-    scores = sims.copy()
+    sims = np.asarray(sims, dtype="float32")
 
     if use_popularity and "popularity" in results.columns:
         pop_vals = pd.to_numeric(results["popularity"], errors="coerce").fillna(0).to_numpy("float32")
-        pop_scale = np.log1p(np.clip(pop_vals, 0, None))
-        max_pop = float(pop_scale.max()) if pop_scale.size else 0.0
-        if max_pop > 0:
-            pop_scale = pop_scale / max_pop
-        scores = scores * (1.0 + pop_scale)
+        pop_adj = np.log1p(np.clip(pop_vals, 0, None)).astype("float32")
+        if pop_adj.size == 0 or float(pop_adj.max()) <= 0:
+            scores = sims
+        else:
+            scores = sims * pop_adj
+    else:
+        scores = sims
 
-    results = results.assign(score=scores.astype("float32"), similarity=sims)
+    results = results.assign(score=scores.astype("float32"), similarity=sims.astype("float32"))
 
     if safe_mode and not results.empty:
         if "nsfw" in results.columns:
@@ -556,6 +603,7 @@ def run_search(
     return results[keep].head(top_k).reset_index(drop=True)
 
 # ---------------- UI helpers ----------------
+
 def render_results_as_cards(df: pd.DataFrame, show_franchise: bool = False) -> None:
     if df.empty:
         st.info("No results found.")
