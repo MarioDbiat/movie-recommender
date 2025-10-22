@@ -89,12 +89,12 @@ def _resolve_path(path_or_name: str, *, must_be_local: bool) -> Optional[str]:
         return None
 
 # ---------------- Caches ------------------------------------------------------
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_model() -> SentenceTransformer:
     device = "cuda" if (torch.cuda.is_available() and os.environ.get("CUDA_VISIBLE_DEVICES")) else "cpu"
     return SentenceTransformer(MODEL_NAME, device=device)
 
-@st.cache_data(show_spinner=False)
+@st.cache_data
 def load_metadata(parquet_path: str) -> pd.DataFrame:
     resolved = _resolve_path(parquet_path, must_be_local=False)
     try:
@@ -128,7 +128,7 @@ def load_metadata(parquet_path: str) -> pd.DataFrame:
     if "popularity" in df.columns: df["popularity"] = pd.to_numeric(df["popularity"], errors="coerce").fillna(0.0)
     return df
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_faiss(index_path: str):
     if not _HAVE_FAISS:
         return None
@@ -149,7 +149,7 @@ def load_faiss(index_path: str):
         pass
     return idx
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_embeddings(npy_path: str) -> Optional[np.ndarray]:
     # Cloud profile: EMB_FILE="" → always skip
     npy_path = (npy_path or "").strip()
