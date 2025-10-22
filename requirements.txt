@@ -4,6 +4,7 @@ torch==2.2.2+cpu
 
 # --- Core ---
 streamlit==1.40.1
+rich==13.9.4            # pin <14 so Streamlit stays happy
 sentence-transformers==2.2.2
 transformers==4.30.0
 scikit-learn==1.3.2
