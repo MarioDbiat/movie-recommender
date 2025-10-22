@@ -1,7 +1,8 @@
 # app/app.py
 # =========================================
-# Movie Recommender — Streamlit app
+# Movie Recommender — Streamlit app (HF + Stable)
 # HF-aware loaders (parquet / faiss / npy), popularity toggle, safe-mode
+# Embeddings are OPTIONAL; FAISS is OPTIONAL; CPU-by-default; FAISS mmap; thread caps
 # =========================================
 
 # --- Streamlit must be configured first ---
@@ -24,19 +25,27 @@ warnings.filterwarnings(
     module="transformers.modeling_utils",
 )
 
-# Avoid noisy tokenizer threads
+# Safer defaults to avoid noisy crashes on mixed environments
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")   # CPU by default (flip later if you want GPU)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # Optional FAISS (app still runs without it)
 try:
     import faiss  # type: ignore
     _HAVE_FAISS = True
+    try:
+        faiss.omp_set_num_threads(1)  # tame CPU spikes
+    except Exception:
+        pass
 except Exception:
     faiss = None
     _HAVE_FAISS = False
 
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import hf_hub_download
+import torch
+torch.set_num_threads(1)
 
 # ---------------- Config ----------------
 # Adjust these if your assets live elsewhere.
@@ -103,15 +112,10 @@ def load_model() -> SentenceTransformer:
     """
     Loads your local fine-tuned SBERT folder or HF model id.
     If your repo is private, ensure HF_TOKEN (or HUGGINGFACE_HUB_TOKEN) is set.
+    CPU by default to avoid CUDA probe crashes.
     """
-    try:
-        return SentenceTransformer(MODEL_NAME)
-    except Exception as e:
-        st.error(
-            "Failed to load SentenceTransformer model. "
-            f"MODEL_NAME='{MODEL_NAME}'. Error: {e}"
-        )
-        raise
+    device = "cuda" if (torch.cuda.is_available() and os.environ.get("CUDA_VISIBLE_DEVICES")) else "cpu"
+    return SentenceTransformer(MODEL_NAME, device=device)
 
 @st.cache_data(show_spinner=False)
 def load_metadata(parquet_path: str) -> pd.DataFrame:
@@ -124,7 +128,6 @@ def load_metadata(parquet_path: str) -> pd.DataFrame:
     resolved = _resolve_path(parquet_path, must_be_local=False)
     try:
         if resolved is None:
-            # If nothing resolved but user gave a URL and we demanded local earlier
             if parquet_path.startswith(("http://", "https://")):
                 df = pd.read_parquet(parquet_path)  # pyarrow handles URLs
             else:
@@ -179,9 +182,13 @@ def load_faiss(index_path: str):
     if not local or not os.path.exists(local):
         return None
     try:
-        return faiss.read_index(local)
+        # memory-map for lower RAM use; fall back to normal read
+        return faiss.read_index(local, faiss.IO_FLAG_MMAP)
     except Exception:
-        return None
+        try:
+            return faiss.read_index(local)
+        except Exception:
+            return None
 
 @st.cache_resource(show_spinner=False)
 def load_embeddings(npy_path: str) -> Optional[np.ndarray]:
@@ -238,6 +245,7 @@ def _find_query_movie_franchise(df: pd.DataFrame, query_text: str) -> str:
     return ""
 
 FRANCHISE_KEYWORDS = {
+    # (unchanged – your dictionary)
     "Marvel": [
         "avengers", "iron man", "captain america", "thor", "hulk", "black widow",
         "ant-man", "black panther", "spider-man", "doctor strange", "dr. strange",
@@ -351,25 +359,23 @@ def run_search(
     index_obj = load_faiss(index_name)
     embeddings = load_embeddings(emb_name or "")
 
-    if embeddings is None:
-        st.error("Embeddings file is required for scoring. Make sure EMB_FILE points to a valid .npy (local or on Hugging Face).")
-        return pd.DataFrame()
-
-    if len(df) != len(embeddings):
-        st.error("Embeddings and metadata shapes do not align.")
+    # --- NO hard-crash if embeddings missing: allow FAISS-only / on-the-fly encode
+    if len(df) == 0:
         return pd.DataFrame()
 
     query_clean = query_text.strip()
     if not query_clean:
         return pd.DataFrame()
 
+    # Build query vector from overview (if exact title) or from free text
     query_lower = query_clean.lower()
     movie_row = df[df["title"].str.lower() == query_lower] if "title" in df.columns else pd.DataFrame()
 
     if not movie_row.empty:
         row = movie_row.iloc[0]
         overview = str(row.get("overview", "") or "")
-        query_vec = model.encode(overview, convert_to_tensor=True)
+        # use numpy directly to avoid tensor/device shenanigans
+        query_vec = model.encode([overview], convert_to_numpy=True, normalize_embeddings=True)[0]
         detected_franchise = detect_franchise(str(row.get("title", "")), overview)
         genres_val = row.get("genres", [])
         if isinstance(genres_val, list):
@@ -379,15 +385,18 @@ def run_search(
         use_name_anchor = True
     else:
         overview = query_clean
-        query_vec = model.encode(overview, convert_to_tensor=True)
+        query_vec = model.encode([overview], convert_to_numpy=True, normalize_embeddings=True)[0]
         detected_franchise = detect_franchise("", overview)
         input_genres = set()
         use_name_anchor = False
 
-    query_np = query_vec.detach().cpu().numpy().reshape(1, -1).astype("float32")
+    query_np = query_vec.reshape(1, -1).astype("float32")
     fanout = choose_pool(top_k, use_genres)
 
+    # ------- Candidate retrieval
     candidate_idx = None
+
+    # A) FAISS (if available)
     if index_obj is not None:
         try:
             _, idxs = index_obj.search(query_np, fanout)
@@ -396,26 +405,63 @@ def run_search(
             st.warning(f"FAISS search failed ({exc}); falling back to cosine search.")
             candidate_idx = None
 
-    if candidate_idx is None or len(candidate_idx) == 0:
-        query_vec_np = query_np[0]
+    # B) Embeddings (if available) — global cosine to get candidates
+    if (candidate_idx is None or len(candidate_idx) == 0) and embeddings is not None:
         emb_norms = np.linalg.norm(embeddings, axis=1) + 1e-12
-        sims_all = (embeddings @ query_vec_np) / (emb_norms * (np.linalg.norm(query_vec_np) + 1e-12))
+        sims_all = (embeddings @ query_vec) / (emb_norms * (np.linalg.norm(query_vec) + 1e-12))
+        sims_all = sims_all.astype("float32")
         topn = min(fanout, sims_all.shape[0])
         candidate_idx = np.argsort(-sims_all)[:topn]
-    else:
-        candidate_idx = np.asarray(candidate_idx, dtype=int)
 
+    # C) No FAISS and no embeddings — popularity pool + on-the-fly encoding
+    if candidate_idx is None or len(candidate_idx) == 0:
+        if "popularity" in df.columns:
+            pool = df.nlargest(min(max(5000, fanout), len(df)), "popularity").copy()
+        else:
+            pool = df.head(min(max(5000, fanout), len(df))).copy()
+
+        texts = (
+            pool["overview"].fillna("").astype(str).tolist()
+            if "overview" in pool.columns
+            else pool["title"].astype(str).tolist()
+        )
+        cand_vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        q = (query_np[0] / (np.linalg.norm(query_np[0]) + 1e-12)).astype("float32")
+        E = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
+        sims = (E @ q).astype("float32")
+        part = np.argpartition(-sims, min(len(sims) - 1, fanout - 1))[:fanout]
+        order = np.argsort(-sims[part])
+        top_local = part[order]
+        candidate_idx = pool.index.to_numpy()[top_local]
+
+    # clamp to valid range
+    candidate_idx = np.asarray(candidate_idx, dtype=int)
     candidate_idx = candidate_idx[(candidate_idx >= 0) & (candidate_idx < len(df))]
     if candidate_idx.size == 0:
         return pd.DataFrame()
 
+    # ------- Scoring
     results = df.iloc[candidate_idx].copy()
-    cand_embeddings = embeddings[candidate_idx]
 
-    query_norm = np.linalg.norm(query_np[0]) + 1e-12
-    cand_norms = np.linalg.norm(cand_embeddings, axis=1) + 1e-12
-    sims = (cand_embeddings @ query_np[0]) / (cand_norms * query_norm)
+    # If we have global embeddings, score with them; else encode candidate texts now
+    if embeddings is not None:
+        cand_embeddings = embeddings[candidate_idx]
+        q = query_np[0]
+        query_norm = np.linalg.norm(q) + 1e-12
+        cand_norms = np.linalg.norm(cand_embeddings, axis=1) + 1e-12
+        sims = (cand_embeddings @ q) / (cand_norms * query_norm)
+    else:
+        texts = (
+            results["overview"].fillna("").astype(str).tolist()
+            if "overview" in results.columns
+            else results["title"].astype(str).tolist()
+        )
+        cand_vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        q = (query_np[0] / (np.linalg.norm(query_np[0]) + 1e-12)).astype("float32")
+        E = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
+        sims = (E @ q).astype("float32")
 
+    # Popularity blend (optional)
     if use_popularity and "popularity" in results.columns:
         pop_vals = pd.to_numeric(results["popularity"], errors="coerce").fillna(0).to_numpy("float32")
         scores = (sims * np.log1p(pop_vals)).astype("float32")
@@ -424,6 +470,7 @@ def run_search(
 
     results = results.assign(score=scores, similarity=sims.astype("float32"))
 
+    # Safe mode filter
     if safe_mode and not results.empty:
         if "nsfw" in results.columns:
             results = results[~results["nsfw"].astype(bool)]
@@ -439,44 +486,56 @@ def run_search(
     if results.empty:
         return results
 
-    if franchise_only and detected_franchise != "Unknown" and not results.empty:
+    # Franchise filter (computes missing franchises on the fly if needed)
+    if franchise_only and not results.empty:
         if "franchise" not in results.columns:
             results["franchise"] = "Unknown"
+
+        detected = _find_query_movie_franchise(df, query_clean) or "Unknown"
+        if detected == "Unknown":
+            # fallback: use text-based detector
+            detected = detect_franchise(query_clean, overview)
+
         missing_mask = results["franchise"].fillna("Unknown").isin(["", "Unknown"])
         if missing_mask.any():
             results.loc[missing_mask, "franchise"] = results.loc[missing_mask].apply(
                 lambda row: detect_franchise(str(row.get("title", "")), str(row.get("overview", ""))),
                 axis=1,
             )
-        results = results[results["franchise"] == detected_franchise]
+        results = results[results["franchise"] == detected]
 
     if results.empty:
         return results
 
-    if use_genres and input_genres and not results.empty:
-        def genre_overlap(val):
-            if isinstance(val, list):
-                working = {g for g in val if g != "Unknown"}
-            else:
-                working = set(_split_genres(str(val)))
-            return len(input_genres & working)
+    # Genre overlap filter (softened fallback to keep enough results)
+    if use_genres:
+        input_genres = _find_query_movie_genres(df, query_clean)
+        input_genres = set(input_genres) if input_genres else set()
 
-        results = results.assign(genre_overlap=results["genres"].apply(genre_overlap))
-        min_required = 2 if len(input_genres) >= 2 else 1
-        filtered = results[results["genre_overlap"] >= min_required]
+        if input_genres and not results.empty:
+            def genre_overlap(val):
+                if isinstance(val, list):
+                    working = {g for g in val if g != "Unknown"}
+                else:
+                    working = set(_split_genres(str(val)))
+                return len(input_genres & working)
 
-        if len(filtered) < top_k and results["genre_overlap"].max() >= 1:
-            fallback_threshold = 1 if min_required > 1 else 0
-            filtered = results[results["genre_overlap"] >= fallback_threshold]
+            results = results.assign(genre_overlap=results["genres"].apply(genre_overlap) if "genres" in results.columns else 0)
+            min_required = 2 if len(input_genres) >= 2 else 1
 
-        results = filtered
-        if not results.empty:
-            results = results.assign(score=results["score"] * (1.0 + 0.05 * results["genre_overlap"]))
+            filtered = results[results["genre_overlap"] >= min_required]
+            if len(filtered) < top_k and results["genre_overlap"].max() >= 1:
+                filtered = results[results["genre_overlap"] >= 1]
+            results = filtered
+
+            if not results.empty:
+                results = results.assign(score=results["score"] * (1.0 + 0.05 * results.get("genre_overlap", 0)))
 
     if results.empty:
         return results
 
-    if use_name_anchor and "title" in results.columns:
+    # Exclude the exact title itself from results
+    if "title" in results.columns:
         results = results[results["title"].str.lower() != query_lower]
 
     if results.empty:
@@ -485,11 +544,13 @@ def run_search(
     results = results.sort_values(by="score", ascending=False)
     top_results = results.head(top_k).copy()
 
+    # Franchise cleanup
     if "franchise" not in top_results.columns:
         top_results["franchise"] = "Unknown"
     else:
         top_results["franchise"] = top_results["franchise"].fillna("Unknown").replace("", "Unknown")
 
+    # Posters
     if "poster_path" in top_results.columns:
         top_results["poster_url"] = top_results["poster_path"].astype(str).str.strip()
         mask = top_results["poster_url"].str.len() > 0
@@ -561,7 +622,7 @@ if st.button("Recommend", type="primary"):
             out = run_search(
                 parquet_name=PARQUET_FILE,
                 index_name=INDEX_FILE,
-                emb_name=EMB_FILE,
+                emb_name=EMB_FILE,           # now OPTIONAL – app still works if this is missing
                 query_text=query.strip(),
                 franchise_only=franchise_only,
                 safe_mode=safe_mode,
