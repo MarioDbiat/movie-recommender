@@ -1,23 +1,18 @@
-# app.py  — FAISS-only (cloud-friendly)
+# app.py — FAISS-only, Cloud-safe
 # =========================================
-# Movie Recommender — Streamlit app (HF + Stable, no global embeddings)
-# Uses FAISS for candidates; encodes candidates on-the-fly for scoring
-# CPU by default; FAISS mmap; thread caps; safe fallbacks
+# Uses FAISS for candidate retrieval; encodes candidates on-the-fly for scoring.
+# CPU by default; FAISS mmap; capped fanout; small fallback pool; IVF nprobe set.
 # =========================================
 
-# --- Streamlit must be configured first ---
 import streamlit as st
 st.set_page_config(page_title="Movie Recommender", layout="wide")
 
-# --- Std/3p imports ---
 import os
 import warnings
 from typing import Optional, List, Tuple
-
 import numpy as np
 import pandas as pd
 
-# Silence specific FutureWarning from transformers -> torch.load
 warnings.filterwarnings(
     "ignore",
     message=r"You are using `torch.load` with `weights_only=False`",
@@ -25,17 +20,16 @@ warnings.filterwarnings(
     module="transformers.modeling_utils",
 )
 
-# Safer defaults to avoid crashes on small cloud containers
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")   # CPU by default (flip later if you want GPU)
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")   # CPU by default
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-# Optional FAISS (app still runs without it)
+# ---- FAISS (optional) -------------------------------------------------------
 try:
-    import faiss  # type: ignore
+    import faiss
     _HAVE_FAISS = True
     try:
-        faiss.omp_set_num_threads(1)  # tame CPU spikes
+        faiss.omp_set_num_threads(1)  # avoid CPU spikes
     except Exception:
         pass
 except Exception:
@@ -47,47 +41,38 @@ from huggingface_hub import hf_hub_download
 import torch
 torch.set_num_threads(1)
 
-# ---------------- Config ----------------
+# ---------------- Config (reads from Secrets or falls back to defaults) ------
 MODEL_NAME   = os.getenv("MODEL_NAME", "Mariodb/movie-recommender-model").strip()
-
 PARQUET_FILE = os.getenv("PARQUET_FILE", "movies.parquet").strip()
 INDEX_FILE   = os.getenv("INDEX_FILE",   "movie_index.faiss").strip()
-# FAISS-only profile: leave EMB_FILE empty in Secrets (no download)
-EMB_FILE     = os.getenv("EMB_FILE", "").strip()   # MUST be "" for cloud Option A
+EMB_FILE     = os.getenv("EMB_FILE", "").strip()   # ⬅️ keep empty in cloud (FAISS-only)
 
 HF_REPO_ID   = os.getenv("HF_REPO_ID", "Mariodb/movie-recommender-dataset").strip()
 HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset").strip()
 HF_REVISION  = os.getenv("HF_REVISION", "main").strip()
-HF_TOKEN     = os.getenv("HF_TOKEN")  # optional; needed only for private repos
+HF_TOKEN     = os.getenv("HF_TOKEN")  # optional, needed for private repos
 
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
 
-# Cloud mode caps (keeps memory under control)
+# ---------------- Cloud caps --------------------------------------------------
 CLOUD_MODE = True
-CLOUD_FANOUT_MAX = 120          # candidate fanout upper bound online
-CLOUD_FALLBACK_POOL = 4000      # if FAISS missing, encode up to this many popular items
+CLOUD_FANOUT_MAX = 64        # tighter cap to stay well under RAM
+CLOUD_FALLBACK_POOL = 2500   # encode-at-most this many if FAISS missing
 
 def choose_pool(top_k: int, use_genres: bool) -> int:
-    base = max(top_k * 20, top_k)
-    if CLOUD_MODE:
-        return min(base, CLOUD_FANOUT_MAX)
-    return base
+    base = max(top_k * 20, top_k)  # same spirit as your old app
+    return min(base, CLOUD_FANOUT_MAX) if CLOUD_MODE else base
 
-# ---------------- Path resolver (local / URL / HF) ----------------
+# ---------------- Hugging Face path resolver ---------------------------------
 def _resolve_path(path_or_name: str, *, must_be_local: bool) -> Optional[str]:
-    """
-    Return a path to use. Order:
-      1) If a local file exists at `path_or_name`, use it.
-      2) If it's http(s) and not must_be_local -> return the URL (pandas parquet can stream).
-      3) Attempt to download basename(path_or_name) from HF repo to ./data.
-    For FAISS we set must_be_local=True (needs a local file).
-    """
+    """Prefer local; else URL (if allowed); else download from HF to ./data."""
     if not path_or_name:
         return None
     if os.path.exists(path_or_name):
         return path_or_name
     if path_or_name.startswith(("http://", "https://")):
         return None if must_be_local else path_or_name
+
     filename = os.path.basename(path_or_name)
     try:
         local = hf_hub_download(
@@ -97,13 +82,13 @@ def _resolve_path(path_or_name: str, *, must_be_local: bool) -> Optional[str]:
             revision=HF_REVISION,
             local_dir="data",
             local_dir_use_symlinks=False,
-            token=HF_TOKEN,  # harmless if None for public repos
+            token=HF_TOKEN,
         )
         return local
     except Exception:
         return None
 
-# ---------------- Caching layers ----------------
+# ---------------- Caches ------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model() -> SentenceTransformer:
     device = "cuda" if (torch.cuda.is_available() and os.environ.get("CUDA_VISIBLE_DEVICES")) else "cpu"
@@ -125,29 +110,22 @@ def load_metadata(parquet_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = df.reset_index(drop=True)
-
-    # Normalize columns
-    if "title" in df.columns:
-        df["title"] = df["title"].astype(str)
-    if "overview" in df.columns:
-        df["overview"] = df["overview"].fillna("").astype(str)
+    if "title" in df.columns: df["title"] = df["title"].astype(str)
+    if "overview" in df.columns: df["overview"] = df["overview"].fillna("").astype(str)
     if "genres" in df.columns:
         def _fix_genres(x):
             if isinstance(x, list):
                 return [g for g in x if str(g).strip().lower() != "unknown"]
             s = str(x).strip()
-            if not s or s.lower() == "unknown":
-                return []
+            if not s or s.lower() == "unknown": return []
             for sep in ("|", ",", ";", "/"):
                 if sep in s:
                     return [g.strip() for g in s.split(sep)
                             if g.strip() and g.strip().lower() != "unknown"]
             return [s] if s.lower() != "unknown" else []
         df["genres"] = df["genres"].apply(_fix_genres)
-    if "franchise" in df.columns:
-        df["franchise"] = df["franchise"].fillna("Unknown").astype(str)
-    if "popularity" in df.columns:
-        df["popularity"] = pd.to_numeric(df["popularity"], errors="coerce").fillna(0.0)
+    if "franchise" in df.columns: df["franchise"] = df["franchise"].fillna("Unknown").astype(str)
+    if "popularity" in df.columns: df["popularity"] = pd.to_numeric(df["popularity"], errors="coerce").fillna(0.0)
     return df
 
 @st.cache_resource(show_spinner=False)
@@ -158,19 +136,25 @@ def load_faiss(index_path: str):
     if not local or not os.path.exists(local):
         return None
     try:
-        return faiss.read_index(local, faiss.IO_FLAG_MMAP)
+        idx = faiss.read_index(local, faiss.IO_FLAG_MMAP)
     except Exception:
         try:
-            return faiss.read_index(local)
+            idx = faiss.read_index(local)
         except Exception:
             return None
+    # ✅ IVF/PQ-friendly probe (ignored by Flat indexes)
+    try:
+        idx.nprobe = 16
+    except Exception:
+        pass
+    return idx
 
-# Embeddings loader intentionally returns None when EMB_FILE==""
 @st.cache_resource(show_spinner=False)
 def load_embeddings(npy_path: str) -> Optional[np.ndarray]:
+    # Cloud profile: EMB_FILE="" → always skip
     npy_path = (npy_path or "").strip()
     if npy_path == "":
-        return None  # FAISS-only profile (Option A)
+        return None
     local = _resolve_path(npy_path, must_be_local=True)
     if not local or not os.path.exists(local):
         return None
@@ -180,21 +164,17 @@ def load_embeddings(npy_path: str) -> Optional[np.ndarray]:
     except Exception:
         return None
 
-# ---------------- Utilities ----------------
+# ---------------- Utilities ---------------------------------------------------
 def _split_genres(s: str) -> List[str]:
-    if not isinstance(s, str):
-        return []
+    if not isinstance(s, str): return []
     s = s.strip()
-    if not s or s.lower() == "unknown":
-        return []
+    if not s or s.lower() == "unknown": return []
     for sep in ["|", ",", ";", "/"]:
         if sep in s:
-            return [g.strip() for g in s.split(sep)
-                    if g.strip() and g.lower() != "unknown"]
+            return [g.strip() for g in s.split(sep) if g.strip() and g.lower() != "unknown"]
     return [s] if s.lower() != "unknown" else []
 
 FRANCHISE_KEYWORDS = {
-    # shortened for brevity — keep your full mapping here
     "Marvel": ["avengers","iron man","captain america","thor","hulk","black widow","spider-man","doctor strange"],
     "DC": ["batman","superman","wonder woman","aquaman","flash","justice league","joker","shazam"],
     "Harry Potter": ["harry potter","hogwarts","voldemort","dumbledore","hermione","ron weasley","fantastic beasts"],
@@ -204,22 +184,12 @@ FRANCHISE_KEYWORDS = {
 def detect_franchise(title: str, overview: str) -> str:
     text = f"{title} {overview}".lower()
     matches = {}
-    for franchise, keywords in FRANCHISE_KEYWORDS.items():
-        hits = sum(1 for kw in keywords if kw in text)
-        if hits:
-            matches[franchise] = hits
-    if not matches:
-        return "Unknown"
-    return max(matches, key=matches.get)
+    for name, kws in FRANCHISE_KEYWORDS.items():
+        hits = sum(1 for kw in kws if kw in text)
+        if hits: matches[name] = hits
+    return max(matches, key=matches.get) if matches else "Unknown"
 
-def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-    qn = query_vec / (np.linalg.norm(query_vec) + 1e-12)
-    En = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
-    sims = En @ qn
-    idx = np.argsort(-sims)[:k]
-    return idx, sims[idx]
-
-# ---------------- Core search ----------------
+# ---------------- Core search -------------------------------------------------
 def run_search(
     parquet_name: str,
     index_name: str,
@@ -228,35 +198,28 @@ def run_search(
     franchise_only: bool,
     safe_mode: bool,
     use_genres: bool,
-    use_popularity: bool,   # checkbox
+    use_popularity: bool,
     top_k: int,
 ) -> pd.DataFrame:
+
     df = load_metadata(parquet_name)
     model = load_model()
     index_obj = load_faiss(index_name)
     embeddings = load_embeddings(emb_name or "")
 
-    if len(df) == 0:
-        return pd.DataFrame()
-
+    if len(df) == 0: return pd.DataFrame()
     q_text = query_text.strip()
-    if not q_text:
-        return pd.DataFrame()
+    if not q_text: return pd.DataFrame()
 
-    # Determine query vector (exact title -> use its overview; else free text)
-    if "title" in df.columns:
-        exact = df[df["title"].str.lower() == q_text.lower()]
-    else:
-        exact = pd.DataFrame()
-
+    # Build query vector (exact title → use its overview; else free text)
+    exact = df[df["title"].str.lower() == q_text.lower()] if "title" in df.columns else pd.DataFrame()
     if not exact.empty:
         row = exact.iloc[0]
         overview = str(row.get("overview", "") or "")
         q_vec = model.encode([overview], convert_to_numpy=True, normalize_embeddings=True)[0]
         q_franchise = row.get("franchise") or detect_franchise(str(row.get("title","")), overview)
         q_genres = row.get("genres", [])
-        if not isinstance(q_genres, list):
-            q_genres = _split_genres(str(q_genres))
+        if not isinstance(q_genres, list): q_genres = _split_genres(str(q_genres))
     else:
         overview = q_text
         q_vec = model.encode([overview], convert_to_numpy=True, normalize_embeddings=True)[0]
@@ -278,7 +241,7 @@ def run_search(
             st.warning(f"FAISS search failed ({exc}); falling back to popularity pool.")
             cand_idx = None
 
-    # B) If FAISS failed/missing, pick a popularity pool (cloud-safe size)
+    # B) Popularity pool if FAISS missing/failed
     if cand_idx is None or len(cand_idx) == 0:
         pool_n = CLOUD_FALLBACK_POOL if CLOUD_MODE else max(5000, fanout)
         if "popularity" in df.columns:
@@ -298,13 +261,11 @@ def run_search(
         top_local = part[order]
         cand_idx = pool.index.to_numpy()[top_local]
 
-    # clamp
     cand_idx = np.asarray(cand_idx, dtype=int)
     cand_idx = cand_idx[(cand_idx >= 0) & (cand_idx < len(df))]
-    if cand_idx.size == 0:
-        return pd.DataFrame()
+    if cand_idx.size == 0: return pd.DataFrame()
 
-    # --- Scoring (FAISS-only profile: always encode candidates now)
+    # --- Scoring (FAISS-only profile: always encode candidates)
     results = df.iloc[cand_idx].copy()
     texts = (results["overview"].fillna("").astype(str).tolist()
              if "overview" in results.columns else
@@ -314,7 +275,7 @@ def run_search(
     E = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
     sims = (E @ q).astype("float32")
 
-    # Popularity blend (optional)
+    # Popularity blend
     if use_popularity and "popularity" in results.columns:
         pop_vals = pd.to_numeric(results["popularity"], errors="coerce").fillna(0).to_numpy("float32")
         scores = (sims * np.log1p(pop_vals)).astype("float32")
@@ -323,27 +284,25 @@ def run_search(
 
     results = results.assign(score=scores, similarity=sims.astype("float32"))
 
-    # Safe mode filter
+    # Safe mode
     if safe_mode and not results.empty:
         if "nsfw" in results.columns:
             results = results[~results["nsfw"].astype(bool)]
         else:
-            bad_terms = ["nsfw", "adult", "porn", "xxx", "sex", "erotic", "babe"]
-            pattern = "(?i)" + "|".join(bad_terms)
+            bad = ["nsfw","adult","porn","xxx","sex","erotic","babe"]
+            pattern = "(?i)" + "|".join(bad)
             mask = pd.Series(False, index=results.index)
-            for col in ["genres", "title", "overview"]:
+            for col in ["genres","title","overview"]:
                 if col in results.columns:
                     mask |= results[col].astype(str).str.contains(pattern, na=False, regex=True)
             results = results.loc[~mask]
-
-    if results.empty:
-        return results
+    if results.empty: return results
 
     # Franchise filter
     if franchise_only and not results.empty:
-        if "franchise" not in results.columns:
-            results["franchise"] = "Unknown"
-        detected = (exact.iloc[0]["franchise"].strip() if not exact.empty and str(exact.iloc[0].get("franchise","")).strip()
+        if "franchise" not in results.columns: results["franchise"] = "Unknown"
+        detected = (exact.iloc[0]["franchise"].strip()
+                    if (not exact.empty and str(exact.iloc[0].get("franchise","")).strip())
                     else q_franchise)
         if not detected or detected == "Unknown":
             detected = detect_franchise(q_text, overview)
@@ -353,20 +312,16 @@ def run_search(
                 lambda row: detect_franchise(str(row.get("title","")), str(row.get("overview",""))), axis=1
             )
         results = results[results["franchise"] == detected]
+    if results.empty: return results
 
-    if results.empty:
-        return results
-
-    # Genre overlap filter (soft)
+    # Genre overlap (soft)
     if use_genres and not results.empty:
         input_genres = q_genres if isinstance(q_genres, list) else _split_genres(str(q_genres))
         input_genres = set([g for g in input_genres if g and g != "Unknown"])
         if input_genres:
             def genre_overlap(val):
-                if isinstance(val, list):
-                    working = {g for g in val if g != "Unknown"}
-                else:
-                    working = set(_split_genres(str(val)))
+                if isinstance(val, list): working = {g for g in val if g != "Unknown"}
+                else: working = set(_split_genres(str(val)))
                 return len(input_genres & working)
             results = results.assign(
                 genre_overlap=results["genres"].apply(genre_overlap) if "genres" in results.columns else 0
@@ -378,39 +333,29 @@ def run_search(
             results = filtered
             if not results.empty:
                 results = results.assign(score=results["score"] * (1.0 + 0.05 * results.get("genre_overlap", 0)))
-
-    if results.empty:
-        return results
+    if results.empty: return results
 
     # Exclude exact self
     if "title" in results.columns:
         results = results[results["title"].str.lower() != q_text.lower()]
-
-    if results.empty:
-        return results
+    if results.empty: return results
 
     results = results.sort_values(by="score", ascending=False)
-    top_results = results.head(top_k).copy()
+    keep = ["title","genres","franchise","popularity","overview","score","similarity","poster_url","poster_path","id"]
+    exist = [c for c in keep if c in results.columns]
+    out = results.head(top_k).copy()
 
-    if "franchise" not in top_results.columns:
-        top_results["franchise"] = "Unknown"
-    else:
-        top_results["franchise"] = top_results["franchise"].fillna("Unknown").replace("", "Unknown")
+    # Poster
+    if "poster_url" not in out.columns:
+        if "poster_path" in out.columns:
+            out["poster_url"] = out["poster_path"].astype(str).str.strip()
+            m = out["poster_url"].str.len() > 0
+            out.loc[m, "poster_url"] = TMDB_IMG_BASE + out.loc[m, "poster_url"]
+        else:
+            out["poster_url"] = ""
+    return out[exist + (["poster_url"] if "poster_url" in out.columns and "poster_url" not in exist else [])].reset_index(drop=True)
 
-    if "poster_path" in top_results.columns:
-        top_results["poster_url"] = top_results["poster_path"].astype(str).str.strip()
-        mask = top_results["poster_url"].str.len() > 0
-        top_results.loc[mask, "poster_url"] = TMDB_IMG_BASE + top_results.loc[mask, "poster_url"]
-    elif "poster_url" not in top_results.columns:
-        top_results["poster_url"] = ""
-
-    keep = ["title", "genres", "franchise", "popularity", "poster_url", "overview", "score", "similarity"]
-    if "id" in top_results.columns:
-        keep.append("id")
-    exist = [c for c in keep if c in top_results.columns]
-    return top_results[exist].reset_index(drop=True)
-
-# ---------------- UI ----------------
+# ---------------- UI ----------------------------------------------------------
 st.title("🎬 Mario's Netflix (FAISS-only, Cloud Mode)")
 
 with st.expander("Technical info"):
@@ -426,16 +371,11 @@ query = st.text_input("Title or description", placeholder="e.g., Interstellar �
 
 st.divider()
 st.subheader("⚙️ Filters")
-
 col1, col2, col3, col4 = st.columns(4)
-with col1:
-    franchise_only = st.checkbox("Filter by franchise", value=False)
-with col2:
-    use_genres = st.checkbox("Use genres of query movie", value=False)
-with col3:
-    safe_mode = st.checkbox("Safe mode (hide NSFW)", value=True)
-with col4:
-    use_popularity = st.checkbox("Use popularity boost", value=True)
+with col1: franchise_only = st.checkbox("Filter by franchise", value=False)
+with col2: use_genres = st.checkbox("Use genres of query movie", value=False)
+with col3: safe_mode = st.checkbox("Safe mode (hide NSFW)", value=True)
+with col4: use_popularity = st.checkbox("Use popularity boost", value=True)
 
 top_k = st.slider("How many recommendations?", min_value=5, max_value=50, value=10, step=5)
 
@@ -473,16 +413,12 @@ if st.button("Recommend", type="primary"):
                         st.caption(
                             f"Genres: {', '.join(row['genres']) if isinstance(row['genres'], list) else row['genres']}"
                         )
-                    if row.get("franchise"):
-                        st.caption(f"🎬 Franchise: {row['franchise']}")
+                    if row.get("franchise"): st.caption(f"🎬 Franchise: {row['franchise']}")
                     if row.get("popularity") is not None:
-                        try:
-                            st.caption(f"⭐ Popularity: {float(row['popularity']):.2f}")
-                        except Exception:
-                            pass
-                    if row.get("overview"):
-                        st.write(row["overview"])
+                        try: st.caption(f"⭐ Popularity: {float(row['popularity']):.2f}")
+                        except Exception: pass
+                    if row.get("overview"): st.write(row["overview"])
                 st.divider()
 
             with st.expander("See raw table"):
-                st.dataframe(out)
+                st.dataframe(out, use_container_width=True)
