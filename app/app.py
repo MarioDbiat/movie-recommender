@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 # ---------------- Mode / config (env-overridable) ----------------
 # MODE = auto | lite | full
 MODE = os.getenv("MODE", "auto").lower().strip()
-_load_emb_raw = os.getenv("LOAD_EMB", "0")
+_load_emb_raw = os.getenv("LOAD_EMB", "1")
 LOAD_EMB = str(_load_emb_raw).strip().lower() in {"1", "true", "yes", "on"}
 
 # Hugging Face dataset repo
@@ -60,6 +60,16 @@ EMB_OVERRIDE     = os.getenv("EMB_FILE", "").strip()
 if EMB_OVERRIDE:
     LOAD_EMB = True
 
+EMB_USE_MMAP_SETTING = os.getenv("EMB_USE_MMAP", "").strip().lower()
+if EMB_USE_MMAP_SETTING in {"0", "false", "no", "off"}:
+    EMB_USE_MMAP = False
+elif EMB_USE_MMAP_SETTING in {"1", "true", "yes", "on"}:
+    EMB_USE_MMAP = True
+else:
+    EMB_USE_MMAP = None
+
+EMB_INMEMORY_MAX_MB = int(os.getenv("EMB_INMEMORY_MAX_MB", "1536"))
+
 DEFAULT_LOCAL_EMB = (
     os.path.join(os.getcwd(), FULL_EMB) if FULL_EMB and not os.path.isabs(FULL_EMB) else FULL_EMB
 )
@@ -71,8 +81,15 @@ DATA_CSV   = os.getenv("DATA_CSV",   "data/movies.csv")
 FAISS_PATH = os.getenv("FAISS_PATH", "indexes/movie_index.faiss")
 EMB_PATH   = os.getenv("EMB_PATH",   "artifacts/movie_embeddings.npy")
 
-# Model
+# Retrieval model
 MODEL_ID = os.getenv("MODEL_ID", "Mariodb/movie-recommender-model").strip()
+
+# Query rewrite model (public HF model by default)
+ENABLE_LLM_REWRITE = os.getenv("ENABLE_LLM_REWRITE", "1").strip().lower() in {"1", "true", "yes", "on"}
+REWRITE_MODEL_ID = os.getenv("REWRITE_MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct").strip()
+REWRITE_MAX_NEW_TOKENS = int(os.getenv("REWRITE_MAX_NEW_TOKENS", "80"))
+REWRITE_TEMPERATURE = float(os.getenv("REWRITE_TEMPERATURE", "0.0"))
+USE_ORIGINAL_PLUS_REWRITE = os.getenv("USE_ORIGINAL_PLUS_REWRITE", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 # Pools (Cloud-friendly defaults)
 POOL_BASE = int(os.getenv("POOL_BASE", "50"))
@@ -90,6 +107,16 @@ try:
         pass
 except Exception:
     pass
+
+# Optional rewrite stack availability
+REWRITE_STACK_OK = False
+REWRITE_IMPORT_ERROR = ""
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    REWRITE_STACK_OK = True
+except Exception as e:
+    REWRITE_IMPORT_ERROR = str(e)
 
 # ---------------- Utilities ----------------
 def _split_genres(s: str) -> List[str]:
@@ -161,6 +188,35 @@ _FRANCHISE_KEYWORDS = {
 
 NSFW_TERMS = ["nsfw", "adult", "porn", "xxx", "sex", "erotic", "babe"]
 
+GENERIC_VIBE_WORDS = {
+    "good", "nice", "best", "movie", "film", "something", "fun", "cool", "great",
+    "watch", "story", "vibe", "vibes", "feels", "feel", "feeling", "atmosphere"
+}
+
+MOOD_WORDS = {
+    "rainy", "cozy", "warm", "cold", "lonely", "sad", "dark", "dreamy",
+    "nostalgic", "emotional", "beautiful", "quiet", "slow", "calm",
+    "bittersweet", "haunting", "melancholic", "melancholy", "tense",
+    "romantic", "tragic", "hopeful", "uplifting", "empty", "soft"
+}
+
+SETTING_WORDS = {
+    "city", "town", "village", "space", "school", "house", "forest", "sea",
+    "ocean", "mountains", "road", "train", "war", "prison", "hotel", "island"
+}
+
+GENRE_WORDS = {
+    "drama", "thriller", "romance", "comedy", "horror", "sci-fi", "scifi",
+    "science fiction", "mystery", "crime", "fantasy", "adventure", "action",
+    "family", "animation", "animated", "psychological"
+}
+
+THEME_WORDS = {
+    "grief", "loss", "love", "loneliness", "memory", "healing", "revenge",
+    "survival", "friendship", "betrayal", "obsession", "identity", "hope",
+    "isolation", "family", "death", "regret", "childhood"
+}
+
 def detect_franchise(title: str, overview: str) -> str:
     text = f"{str(title)} {str(overview)}".lower()
     matches = {}
@@ -220,6 +276,172 @@ def _find_query_movie_franchise(df: pd.DataFrame, query_text: str) -> str:
             return str(row.iloc[0]["franchise"]).strip()
     return ""
 
+def _clean_tokens(text: str) -> List[str]:
+    return [w.strip(".,!?;:()[]{}\"'").lower() for w in text.split() if w.strip()]
+
+def looks_like_title_query(df: pd.DataFrame, query: str) -> bool:
+    if not query.strip() or "title" not in df.columns:
+        return False
+
+    q = query.strip().lower()
+    exact = df["title"].astype(str).str.lower().eq(q).any()
+    if exact:
+        return True
+
+    sample = df.nlargest(50000, "popularity") if "popularity" in df.columns and len(df) > 50000 else df
+    titles = sample["title"].astype(str).tolist()
+    return len(difflib.get_close_matches(query, titles, n=1, cutoff=0.92)) > 0
+
+def analyze_query_style(query: str) -> dict:
+    tokens = _clean_tokens(query)
+
+    generic_count = sum(t in GENERIC_VIBE_WORDS for t in tokens)
+    mood_count = sum(t in MOOD_WORDS for t in tokens)
+    setting_count = sum(t in SETTING_WORDS for t in tokens)
+    genre_count = sum(t in GENRE_WORDS for t in tokens)
+    theme_count = sum(t in THEME_WORDS for t in tokens)
+
+    has_plot_signals = any(
+        phrase in query.lower()
+        for phrase in [
+            "about", "who", "struggles", "trying to", "must", "after", "when",
+            "set in", "follows", "discovers", "forced to", "falls in love",
+            "investigates", "journey", "survive", "survival"
+        ]
+    )
+
+    meaningful_count = mood_count + setting_count + genre_count + theme_count
+
+    return {
+        "word_count": len(tokens),
+        "generic_count": generic_count,
+        "mood_count": mood_count,
+        "setting_count": setting_count,
+        "genre_count": genre_count,
+        "theme_count": theme_count,
+        "meaningful_count": meaningful_count,
+        "has_plot_signals": has_plot_signals,
+        "is_vibe_heavy": mood_count >= 1 and not has_plot_signals,
+        "is_too_short": len(tokens) < 6,
+        "is_too_generic": meaningful_count == 0 or (generic_count >= max(1, len(tokens) // 2)),
+    }
+
+def _build_fallback_rewrite(user_query: str) -> str:
+    q = user_query.strip()
+    if not q:
+        return q
+
+    q_lower = q.lower()
+    info = analyze_query_style(q)
+
+    mood_map = {
+        "rainy": "melancholic, quiet, reflective",
+        "cozy": "warm, intimate, comforting",
+        "warm": "emotionally warm, intimate, heartfelt",
+        "cold": "emotionally distant, bleak, tense",
+        "lonely": "loneliness, isolation, emotional distance",
+        "sad": "grief, sadness, emotional pain",
+        "dark": "dark, serious, emotionally intense",
+        "dreamy": "dreamlike, reflective, emotionally soft",
+        "nostalgic": "memory, nostalgia, bittersweet reflection",
+        "emotional": "strong emotions, personal struggle, human connection",
+        "beautiful": "emotionally rich, reflective, visually evocative",
+        "quiet": "quiet, intimate, character-driven",
+        "slow": "slow-paced, reflective, character-driven",
+        "calm": "calm, reflective, gentle",
+        "bittersweet": "bittersweet, emotional, reflective",
+        "haunting": "haunting, unsettling, emotionally intense",
+        "romantic": "love, intimacy, emotional connection",
+        "tragic": "loss, tragedy, emotional suffering",
+        "hopeful": "healing, hope, emotional recovery",
+        "tense": "psychological tension, suspense, pressure",
+    }
+
+    setting_map = {
+        "city": "in an urban setting",
+        "town": "in a small town",
+        "village": "in a quiet village",
+        "space": "set in space",
+        "school": "set around school life",
+        "house": "centered around a house or home",
+        "forest": "set near a forest or in nature",
+        "sea": "set near the sea",
+        "ocean": "set around the ocean",
+        "road": "during a personal journey or road trip",
+        "war": "during wartime",
+        "prison": "in or around a prison setting",
+        "hotel": "set around a hotel",
+        "island": "set on an isolated island",
+    }
+
+    detected_moods = []
+    for word, expansion in mood_map.items():
+        if word in q_lower:
+            detected_moods.append(expansion)
+
+    detected_settings = []
+    for word, expansion in setting_map.items():
+        if word in q_lower:
+            detected_settings.append(expansion)
+
+    detected_genres = [g for g in GENRE_WORDS if g in q_lower]
+    detected_themes = [t for t in THEME_WORDS if t in q_lower]
+
+    mood_phrase = ", ".join(dict.fromkeys(detected_moods))
+    setting_phrase = ", ".join(dict.fromkeys(detected_settings))
+    genre_phrase = ", ".join(dict.fromkeys(detected_genres))
+    theme_phrase = ", ".join(dict.fromkeys(detected_themes))
+
+    if info["is_vibe_heavy"] or info["is_too_short"] or info["is_too_generic"]:
+        parts = []
+
+        if genre_phrase:
+            parts.append(f"a {genre_phrase} film")
+        else:
+            parts.append("a character-driven drama")
+
+        if mood_phrase:
+            parts.append(f"with a {mood_phrase} tone")
+
+        if theme_phrase:
+            parts.append(f"about {theme_phrase}")
+
+        if setting_phrase:
+            parts.append(setting_phrase)
+
+        rewritten = " ".join(parts).strip().replace("  ", " ")
+        if not rewritten.endswith("."):
+            rewritten += "."
+        if len(_clean_tokens(rewritten)) < 10:
+            rewritten = rewritten[:-1] + " focused on personal struggle, emotion, and human connection."
+        return rewritten
+
+    extras = []
+    if mood_phrase and "tone" not in q_lower and "atmosphere" not in q_lower:
+        extras.append(f"with a {mood_phrase} tone")
+    if setting_phrase and "set" not in q_lower and "setting" not in q_lower:
+        extras.append(setting_phrase)
+
+    if extras:
+        enriched = f"{q}. " + ", ".join(extras) + "."
+        return enriched.replace("..", ".").strip()
+
+    return q
+
+def should_rewrite_query(df: pd.DataFrame, query: str, search_mode: str) -> bool:
+    q = query.strip()
+    if not q:
+        return False
+
+    if search_mode == "Movie title":
+        return False
+
+    if looks_like_title_query(df, q):
+        return False
+
+    info = analyze_query_style(q)
+    return info["is_too_short"] or info["is_vibe_heavy"] or info["is_too_generic"]
+
 # ---------------- HF helpers ----------------
 @st.cache_data
 def _hf_path(filename: str) -> str:
@@ -251,6 +473,29 @@ def _choose_files() -> Tuple[str, str, Optional[str]]:
 @st.cache_resource
 def load_model():
     return SentenceTransformer(MODEL_ID)
+
+@st.cache_resource
+def load_rewriter():
+    if not ENABLE_LLM_REWRITE:
+        raise RuntimeError("LLM rewriting is disabled by config.")
+    if not REWRITE_STACK_OK:
+        raise RuntimeError(f"Rewrite stack unavailable: {REWRITE_IMPORT_ERROR}")
+
+    tokenizer = AutoTokenizer.from_pretrained(REWRITE_MODEL_ID, token=HF_TOKEN)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(
+        REWRITE_MODEL_ID,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        token=HF_TOKEN,
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    return tokenizer, model, device
 
 @st.cache_resource
 def load_metadata(parquet_name: str) -> pd.DataFrame:
@@ -285,7 +530,6 @@ def load_metadata(parquet_name: str) -> pd.DataFrame:
                 )
                 st.stop()
 
-    # Normalize columns we use
     for col in ["title", "overview", "genres", "franchise"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
@@ -294,10 +538,8 @@ def load_metadata(parquet_name: str) -> pd.DataFrame:
     if "genres" in df.columns:
         df["genres"] = df["genres"].apply(lambda s: "" if str(s).strip().lower() == "unknown" else s)
 
-    # Ensure franchise column
     df = _ensure_franchise(df)
 
-    # If some columns are missing, create them so UI doesn't crash
     for col in ["title", "genres", "franchise", "popularity", "overview"]:
         if col not in df.columns:
             df[col] = "" if col != "popularity" else 0.0
@@ -311,11 +553,10 @@ def load_faiss(index_name: str):
         return None
 
     def _load_one(name: str):
-        # Use local path if present, otherwise fetch from HF
         path = FAISS_PATH if os.path.exists(FAISS_PATH) else _hf_path(name)
-        idx = faiss.read_index(path, faiss.IO_FLAG_MMAP)  # mmap to avoid huge RAM
+        idx = faiss.read_index(path, faiss.IO_FLAG_MMAP)
         try:
-            idx.nprobe = int(os.getenv("FAISS_NPROBE", "16"))  # good default for IVF
+            idx.nprobe = int(os.getenv("FAISS_NPROBE", "16"))
         except Exception:
             pass
         return idx
@@ -326,7 +567,7 @@ def load_faiss(index_name: str):
         msg = str(e).lower()
         if ("404" in msg or "entry not found" in msg) and index_name != FULL_INDEX:
             try:
-                return _load_one(FULL_INDEX)  # fallback to full name
+                return _load_one(FULL_INDEX)
             except Exception as e2:
                 st.error(f"FAISS load failed (tried {index_name} then {FULL_INDEX}): {e2}")
                 return None
@@ -346,7 +587,6 @@ def load_embeddings(emb_name: Optional[str]) -> Optional[np.ndarray]:
         if os.path.isabs(emb_name):
             candidates.append(emb_name)
         else:
-            # Check common relative locations before downloading from HF
             candidates.extend([
                 os.path.join(os.getcwd(), emb_name),
                 os.path.join("app", emb_name),
@@ -359,7 +599,20 @@ def load_embeddings(emb_name: Optional[str]) -> Optional[np.ndarray]:
             path = _hf_path(emb_name)
             if not os.path.exists(path):
                 return None
-        arr = np.load(path, mmap_mode="r")
+
+        use_mmap = EMB_USE_MMAP
+        try:
+            size_bytes = os.path.getsize(path)
+        except OSError:
+            size_bytes = 0
+        if use_mmap is None:
+            threshold = max(EMB_INMEMORY_MAX_MB, 256) * 1024 * 1024
+            use_mmap = size_bytes > threshold if size_bytes else True
+
+        if use_mmap:
+            arr = np.load(path, mmap_mode="r")
+            return arr.astype("float32") if arr.dtype != np.float32 else arr
+        arr = np.load(path)
         return arr.astype("float32") if arr.dtype != np.float32 else arr
     except Exception as e:
         st.warning(f"Embeddings fallback not available: {e}")
@@ -374,6 +627,91 @@ def cosine_topk(query_vec: np.ndarray, emb: np.ndarray, k: int):
     sims = e @ q
     idx = np.argsort(-sims)[:k]
     return idx, sims[idx]
+
+def _build_rewrite_prompt(user_query: str) -> str:
+    return (
+        "Rewrite the following movie search request into a concise, retrieval-friendly movie overview style description.\n"
+        "Rules:\n"
+        "- Keep the original meaning, mood, and intent.\n"
+        "- Match the style of IMDb/TMDB plot overviews and recommendation descriptions.\n"
+        "- Add likely genre, tone, themes, setting, or conflict only if strongly implied.\n"
+        "- Do not mention actors, directors, or specific movie titles unless the user did.\n"
+        "- Keep it to 1 or 2 sentences maximum.\n"
+        "- Output only the rewritten query, with no labels or explanation.\n\n"
+        f"User query: {user_query}"
+    )
+
+def _llm_rewrite_query(user_query: str) -> str:
+    tokenizer, model, device = load_rewriter()
+    prompt = _build_rewrite_prompt(user_query)
+
+    messages = [
+        {"role": "system", "content": "You rewrite movie preference queries into retrieval-friendly overview-style descriptions."},
+        {"role": "user", "content": prompt},
+    ]
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt"
+        )
+    else:
+        fallback_prompt = "\n\n".join([m["content"] for m in messages])
+        inputs = tokenizer(fallback_prompt, return_tensors="pt").input_ids
+
+    inputs = inputs.to(device)
+    attention_mask = torch.ones_like(inputs)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=inputs,
+            attention_mask=attention_mask,
+            max_new_tokens=REWRITE_MAX_NEW_TOKENS,
+            do_sample=REWRITE_TEMPERATURE > 0,
+            temperature=max(REWRITE_TEMPERATURE, 1e-5),
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    generated = outputs[0][inputs.shape[-1]:]
+    text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    if not text:
+        raise RuntimeError("Rewrite model returned empty output.")
+
+    first_line = text.splitlines()[0].strip()
+    cleaned = first_line.strip('"')
+    if len(cleaned) < 10:
+        raise RuntimeError("Rewrite model returned an unusably short rewrite.")
+    return cleaned
+
+def rewrite_query_to_imdb_style(user_query: str) -> Tuple[str, str]:
+    fallback = _build_fallback_rewrite(user_query)
+
+    if not ENABLE_LLM_REWRITE:
+        return fallback, "rule-based fallback (LLM disabled)"
+
+    try:
+        rewritten = _llm_rewrite_query(user_query)
+        return rewritten, f"LLM rewrite via {REWRITE_MODEL_ID}"
+    except Exception as e:
+        return fallback, f"rule-based fallback ({e})"
+
+def prepare_query_for_retrieval(original_query: str, rewritten_query: str) -> str:
+    original = original_query.strip()
+    rewritten = rewritten_query.strip()
+
+    if not original:
+        return rewritten
+    if not rewritten:
+        return original
+    if not USE_ORIGINAL_PLUS_REWRITE:
+        return rewritten
+    if original.lower() == rewritten.lower():
+        return rewritten
+    return f"{original}. {rewritten}"
 
 def run_search(
     parquet_name: str,
@@ -391,7 +729,6 @@ def run_search(
     if meta.empty:
         return pd.DataFrame()
 
-    meta = _ensure_franchise(meta.copy())
     model = load_model()
     index_obj = load_faiss(index_name)
 
@@ -401,14 +738,29 @@ def run_search(
     elif LOAD_EMB and FULL_EMB:
         embeddings = load_embeddings(FULL_EMB)
 
+    st.write("DEBUG - metadata rows:", len(meta))
+    st.write("DEBUG - LOAD_EMB:", LOAD_EMB)
+    st.write("DEBUG - emb_name argument:", emb_name)
+    st.write("DEBUG - FULL_EMB:", FULL_EMB)
+    st.write("DEBUG - embeddings object loaded:", embeddings is not None)
+    if embeddings is not None:
+        st.write("DEBUG - embeddings dtype:", getattr(embeddings, "dtype", None))
+        st.write("DEBUG - embeddings shape:", getattr(embeddings, "shape", None))
+    st.write("DEBUG - FAISS loaded:", index_obj is not None)
+
     if embeddings is not None:
         if getattr(embeddings, "dtype", None) != np.float32:
             embeddings = np.asarray(embeddings, dtype="float32")
+
+        st.write("DEBUG - embeddings shape after float32 cast:", embeddings.shape)
+
         if embeddings.shape[0] != len(meta):
             st.warning("Embeddings and metadata shapes do not align; ignoring embeddings for now.")
+            st.write("DEBUG - shape mismatch:", embeddings.shape[0], "!=", len(meta))
             embeddings = None
     elif emb_name:
         st.info("Embeddings file not found; using encoder fallback. Recommendations may be weaker.")
+        st.write("DEBUG - embeddings file path was provided but load_embeddings returned None")
 
     query_clean = query_text.strip()
     if not query_clean:
@@ -451,18 +803,24 @@ def run_search(
         try:
             _, idxs = index_obj.search(query_np, fanout)
             candidate_idx = idxs[0]
+            st.write("DEBUG - candidate source: FAISS")
+            st.write("DEBUG - FAISS candidates count:", len(candidate_idx))
         except Exception as exc:
             st.warning(f"FAISS search failed ({exc}); falling back to embedding search.")
+            st.write("DEBUG - FAISS failed, switching fallback path")
             candidate_idx = None
 
     if (candidate_idx is None or len(candidate_idx) == 0) and embeddings is not None:
+        st.write("DEBUG - candidate source: FULL EMBEDDING SEARCH")
         q_norm = np.linalg.norm(query_vec) + 1e-12
         emb_norms = np.linalg.norm(embeddings, axis=1) + 1e-12
         sims_all = (embeddings @ query_vec) / (emb_norms * q_norm)
         topn = min(fanout, sims_all.shape[0])
         candidate_idx = np.argsort(-sims_all)[:topn]
+        st.write("DEBUG - embedding-search candidates count:", len(candidate_idx))
 
     if candidate_idx is None or len(candidate_idx) == 0:
+        st.write("DEBUG - candidate source: ENCODER FALLBACK POOL")
         pool_n = min(len(meta), max(fanout, POOL_WIDE))
         if "popularity" in meta.columns:
             pool_df = meta.nlargest(pool_n, "popularity").copy()
@@ -474,6 +832,7 @@ def run_search(
             if "overview" in pool_df.columns
             else pool_df["title"].astype(str).tolist()
         )
+        st.write("DEBUG - encoding fallback pool size:", len(texts))
         cand_vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
         q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-12)
         cand_norm = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
@@ -490,16 +849,19 @@ def run_search(
     results = meta.iloc[candidate_idx].copy()
 
     if embeddings is not None:
+        st.write("DEBUG - final scoring source: PRECOMPUTED EMBEDDINGS")
         cand_embeddings = embeddings[candidate_idx]
         query_norm = np.linalg.norm(query_vec) + 1e-12
         cand_norms = np.linalg.norm(cand_embeddings, axis=1) + 1e-12
         sims = (cand_embeddings @ query_vec) / (cand_norms * query_norm)
     else:
+        st.write("DEBUG - final scoring source: LIVE ENCODING")
         texts = (
             results["overview"].fillna("").astype(str).tolist()
             if "overview" in results.columns
             else results["title"].astype(str).tolist()
         )
+        st.write("DEBUG - live encoding result count:", len(texts))
         cand_vecs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
         q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-12)
         cand_norm = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-12)
@@ -604,7 +966,6 @@ def run_search(
     return results[keep].head(top_k).reset_index(drop=True)
 
 # ---------------- UI helpers ----------------
-
 def render_results_as_cards(df: pd.DataFrame, show_franchise: bool = False) -> None:
     if df.empty:
         st.info("No results found.")
@@ -640,24 +1001,33 @@ PARQUET_FILE, INDEX_FILE, EMB_FILE = _choose_files()
 # ---------------- UI ----------------
 st.title("Mario's Netflix")
 
-# Friendly intro for end-users
 st.caption(
-    "Looking for your next favorite movie? Type a title or describe what you want to watch, "
-    "and we'll suggest the best matches from classics to hidden gems. "
-    "_Tip: Genre filters only work when you search by an exact movie title._"
+    "Looking for your next favorite movie? Search by exact movie title or describe the kind of movie you want, "
+    "and the app will try to rewrite your description into a retrieval-friendly overview before recommending matches."
 )
 
-# Keep developer info out of the way but accessible
 with st.expander("Technical info"):
     st.write(f"Mode: {MODE}")
     st.write(f"Repo: {HF_REPO_ID}")
     st.write(f"Parquet: {PARQUET_FILE}")
     st.write(f"Index: {INDEX_FILE}")
     st.write(f"Embeddings: {EMB_FILE if LOAD_EMB else 'Disabled'}")
+    st.write(f"LLM rewrite enabled: {ENABLE_LLM_REWRITE}")
+    st.write(f"Rewrite model: {REWRITE_MODEL_ID if ENABLE_LLM_REWRITE else 'Disabled'}")
 
-# ---- Sections: Search / Filters / Results ----
 st.subheader("Search")
-query = st.text_input("Title or description", placeholder="e.g., Interstellar - gritty space survival")
+search_mode = st.radio(
+    "Search mode",
+    ["Movie title", "Describe a movie vibe / story"],
+    horizontal=True
+)
+
+query_placeholder = (
+    "e.g., Interstellar"
+    if search_mode == "Movie title"
+    else "e.g., a quiet emotional movie about grief, loneliness, and healing"
+)
+query = st.text_input("Title or description", placeholder=query_placeholder)
 
 st.divider()
 
@@ -667,12 +1037,14 @@ with col1:
     franchise_only = st.checkbox(
         "Filter by franchise",
         value=False,
+        disabled=(search_mode != "Movie title"),
         help="Only show results from the same franchise as the query movie."
     )
 with col2:
     use_genres = st.checkbox(
         "Use genres of query movie",
         value=False,
+        disabled=(search_mode != "Movie title"),
         help="Hard filter: keep only results sharing at least 2 genres with the query (exact title works best)."
     )
 with col3:
@@ -695,29 +1067,48 @@ top_k = st.slider(
 )
 
 st.divider()
-
 st.subheader("Recommendations")
 
 if st.button("Recommend", type="primary"):
     if not query.strip():
         st.warning("Please enter a title or short description.")
     else:
+        meta_for_check = load_metadata(PARQUET_FILE)
+        raw_query = query.strip()
+        final_query = raw_query
+        rewrite_preview = None
+        rewrite_source = None
+
+        if search_mode == "Describe a movie vibe / story" and should_rewrite_query(meta_for_check, raw_query, search_mode):
+            rewritten_query, rewrite_source = rewrite_query_to_imdb_style(raw_query)
+            final_query = prepare_query_for_retrieval(raw_query, rewritten_query)
+            rewrite_preview = rewritten_query
+
+        if rewrite_preview:
+            with st.expander("Expanded query used for retrieval", expanded=False):
+                st.write("Original query:")
+                st.write(raw_query)
+                st.write("Rewritten query:")
+                st.write(rewrite_preview)
+                st.write("Embedding input actually searched:")
+                st.write(final_query)
+                st.caption(rewrite_source)
+
         with st.spinner("Finding great matches..."):
             out = run_search(
                 parquet_name=PARQUET_FILE,
                 index_name=INDEX_FILE,
                 emb_name=EMB_FILE,
-                query_text=query.strip(),
-                franchise_only=franchise_only,
+                query_text=final_query,
+                franchise_only=franchise_only if search_mode == "Movie title" else False,
                 safe_mode=safe_mode,
-                use_genres=use_genres,
+                use_genres=use_genres if search_mode == "Movie title" else False,
                 use_popularity=use_popularity,
                 top_k=top_k,
             )
         if out.empty:
             st.info("No results. Try fewer filters or a different query.")
         else:
-            render_results_as_cards(out, show_franchise=franchise_only)
+            render_results_as_cards(out, show_franchise=(franchise_only and search_mode == "Movie title"))
 
-# Small footer
 st.markdown("<br><hr><center>Made with love by Mario</center>", unsafe_allow_html=True)
