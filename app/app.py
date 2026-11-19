@@ -1,3 +1,4 @@
+# **OLD APP** THE NEW APP IS IN ANOTHER REPO -> "movie-recommender-api" THANK YOU FOR USING THIS ONE! IT'S STILL WORKING BUT NO LONGER MAINTAINED. SEE README FOR DETAILS.
 # app/app.py
 # =========================================
 # Movie Recommender — dual-mode (Cloud + Local), Py3.8-safe
